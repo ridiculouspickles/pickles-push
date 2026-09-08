@@ -1,0 +1,294 @@
+package relay
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/yeled/pickles-push/internal/apns"
+	"github.com/yeled/pickles-push/internal/store"
+)
+
+type recordingPusher struct {
+	mu   sync.Mutex
+	sent []apns.Notification
+	err  error
+}
+
+func (p *recordingPusher) Push(_ context.Context, n apns.Notification) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sent = append(p.sent, n)
+	return p.err
+}
+
+func (p *recordingPusher) all() []apns.Notification {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]apns.Notification(nil), p.sent...)
+}
+
+func newRelay(t *testing.T) (*Relay, *recordingPusher) {
+	t.Helper()
+	s, err := store.Open(filepath.Join(t.TempDir(), "r.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pusher := &recordingPusher{}
+	return &Relay{
+		Store:     s,
+		Pusher:    pusher,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		PublicURL: "https://push-a.example.com",
+	}, pusher
+}
+
+func register(t *testing.T, r *Relay, body string) registerResponse {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("register returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response registerResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+const goodRegistration = `{"deviceToken":"abcdef0123456789abcdef0123456789","topic":"net.pickles.mail.dev","sandbox":true}`
+
+func TestRegisterReturnsThisSitesURL(t *testing.T) {
+	r, _ := newRelay(t)
+	response := register(t, r, goodRegistration)
+	if !strings.HasPrefix(response.PushURL, "https://push-a.example.com/v1/push/") {
+		// Each site hands out its own URL; a device holds one subscription per site and
+		// they must not collide.
+		t.Fatalf("push URL was %q", response.PushURL)
+	}
+	if !validToken(response.Token) {
+		t.Fatalf("token %q is not the shape we issue", response.Token)
+	}
+}
+
+func TestRegisterRejectsANonHexDeviceToken(t *testing.T) {
+	r, _ := newRelay(t)
+	request := httptest.NewRequest(http.MethodPost, "/v1/register",
+		strings.NewReader(`{"deviceToken":"not a token at all uh huh","topic":"x"}`))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", recorder.Code)
+	}
+}
+
+func TestReregisteringKeepsTheSameToken(t *testing.T) {
+	r, _ := newRelay(t)
+	first := register(t, r, goodRegistration)
+	// A device re-registers on every foreground. If that minted a new token it would
+	// have to recreate its provider subscription each time, which is the opposite of
+	// what re-registration is for.
+	again := register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","sandbox":true,"token":"`+first.Token+`"}`)
+	if again.Token != first.Token {
+		t.Fatalf("token changed on re-registration: %q then %q", first.Token, again.Token)
+	}
+	if r.Store.Count() != 1 {
+		t.Fatalf("re-registration created a second row: %d", r.Store.Count())
+	}
+}
+
+func TestPushForwardsThePayloadWithoutReadingIt(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, goodRegistration)
+
+	// Deliberately not JSON, and not anything we could parse if we wanted to: this is
+	// what an RFC 8291 encrypted StateChange looks like from here.
+	ciphertext := []byte{0x00, 0x01, 0xff, 0xfe, 0x7f, 0x80}
+	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token,
+		strings.NewReader(string(ciphertext)))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recorder.Code)
+	}
+
+	sent := pusher.all()
+	if len(sent) != 1 {
+		t.Fatalf("expected one push, got %d", len(sent))
+	}
+	var payload struct {
+		APS map[string]any `json:"aps"`
+		P   string         `json:"p"`
+	}
+	if err := json.Unmarshal(sent[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(payload.P)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(decoded) != string(ciphertext) {
+		t.Fatal("the payload reached Apple altered")
+	}
+	if payload.APS["mutable-content"] != float64(1) {
+		// Without this the service extension never runs and the reader only ever sees
+		// the placeholder.
+		t.Fatalf("alert push must be mutable: %v", payload.APS)
+	}
+	if sent[0].Background {
+		t.Fatal("default mode must be an alert, or nothing is ever visible")
+	}
+	if !sent[0].Sandbox {
+		t.Fatal("sandbox flag did not reach the client, so the push would go to the wrong host")
+	}
+}
+
+func TestBackgroundModeSendsASilentPush(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","mode":"background"}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
+	r.Routes().ServeHTTP(httptest.NewRecorder(), request)
+
+	sent := pusher.all()
+	if len(sent) != 1 || !sent[0].Background {
+		t.Fatalf("expected one background push, got %+v", sent)
+	}
+	var payload struct {
+		APS map[string]any `json:"aps"`
+	}
+	_ = json.Unmarshal(sent[0].Payload, &payload)
+	if _, ok := payload.APS["alert"]; ok {
+		// A secondary site must be able to deliver without raising a second banner.
+		t.Fatal("a background push must carry no alert")
+	}
+	if payload.APS["content-available"] != float64(1) {
+		t.Fatalf("background push needs content-available: %v", payload.APS)
+	}
+}
+
+func TestPushToAnUnknownTokenIs404AndSendsNothing(t *testing.T) {
+	r, pusher := newRelay(t)
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/push/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", strings.NewReader("x"))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", recorder.Code)
+	}
+	if len(pusher.all()) != 0 {
+		t.Fatal("an unknown token must not cause a push")
+	}
+}
+
+func TestOversizedPayloadIsRefused(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, goodRegistration)
+	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token,
+		strings.NewReader(strings.Repeat("x", maxPayload+1)))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", recorder.Code)
+	}
+	if len(pusher.all()) != 0 {
+		t.Fatal("nothing oversized should reach Apple, which would reject it anyway")
+	}
+}
+
+func TestAppleSayingGoneDropsTheRegistration(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, goodRegistration)
+	pusher.err = apns.ErrUnregistered
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
+	r.Routes().ServeHTTP(httptest.NewRecorder(), request)
+
+	if _, err := r.Store.Get(response.Token); err == nil {
+		// Apple only tells us once. Keeping the row means pushing into the void for a
+		// month until Prune notices.
+		t.Fatal("a registration Apple reported as gone was kept")
+	}
+}
+
+func TestUnregisterIsQuietAboutWhetherATokenExisted(t *testing.T) {
+	r, _ := newRelay(t)
+	for _, token := range []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "not-a-valid-token"} {
+		request := httptest.NewRequest(http.MethodDelete, "/v1/register/"+token, nil)
+		recorder := httptest.NewRecorder()
+		r.Routes().ServeHTTP(recorder, request)
+		// Distinguishing "malformed" from "unknown" would turn this into an oracle that
+		// confirms whether a guessed token is real.
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("token %q gave %d", token, recorder.Code)
+		}
+	}
+}
+
+func TestGmailEndpointIsClosedUnlessConfigured(t *testing.T) {
+	r, _ := newRelay(t)
+	request := httptest.NewRequest(http.MethodPost, "/v1/gmail", strings.NewReader("{}"))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("with no audience configured the endpoint must not exist, got %d", recorder.Code)
+	}
+}
+
+func TestGmailEndpointRefusesAnUnsignedRequest(t *testing.T) {
+	r, pusher := newRelay(t)
+	r.GmailAudience = "https://push-a.example.com/v1/gmail"
+	r.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+
+	body := `{"message":{"data":"eyJlbWFpbEFkZHJlc3MiOiJhQGdtYWlsLmNvbSIsImhpc3RvcnlJZCI6MX0="}}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/gmail", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		// Unauthenticated, this endpoint lets anyone claim any address has mail and
+		// wake somebody's phone all night.
+		t.Fatalf("expected 403 with no bearer token, got %d", recorder.Code)
+	}
+	if len(pusher.all()) != 0 {
+		t.Fatal("an unverified Pub/Sub request caused a push")
+	}
+}
+
+func TestHealthReportsACountAndNothingElse(t *testing.T) {
+	r, _ := newRelay(t)
+	register(t, r, goodRegistration)
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"registrations":1`) {
+		t.Fatalf("health said %q", body)
+	}
+	// It is a number, not a listing: health checks end up in logs and dashboards.
+	if strings.Contains(body, "abcdef0123456789") {
+		t.Fatal("health leaked a device token")
+	}
+}
+
+func TestValidTokenShape(t *testing.T) {
+	if !validToken("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Fatal("32 url-safe characters is the shape we issue")
+	}
+	for _, bad := range []string{"", "short", strings.Repeat("a", 33), "aaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaa"} {
+		if validToken(bad) {
+			t.Fatalf("%q should not have passed", bad)
+		}
+	}
+}

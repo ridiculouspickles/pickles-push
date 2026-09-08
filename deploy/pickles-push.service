@@ -1,0 +1,47 @@
+# One site. The other site runs an identical copy with a different PUBLIC_URL.
+# They share no state and never talk to each other, so there is nothing to order,
+# quorum, or fail over.
+[Unit]
+Description=Pickles push relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pickles-push
+Group=pickles-push
+ExecStart=/usr/local/bin/pickles-push
+Restart=always
+RestartSec=2
+
+Environment=PICKLES_PUSH_LISTEN=127.0.0.1:8080
+Environment=PICKLES_PUSH_STORE=/var/lib/pickles-push/registrations.json
+# Per site. This is the one value that differs between the two hosts.
+Environment=PICKLES_PUSH_PUBLIC_URL=https://push-a.example.com
+Environment=PICKLES_PUSH_APNS_KEY=/etc/pickles-push/apns.p8
+Environment=PICKLES_PUSH_APNS_KEY_ID=CHANGEME
+Environment=PICKLES_PUSH_APNS_TEAM_ID=CHANGEME
+# Unset to disable the Gmail endpoint entirely.
+#Environment=PICKLES_PUSH_GMAIL_AUDIENCE=https://push-a.example.com/v1/gmail
+
+# It forwards bytes. It has no business doing anything else.
+StateDirectory=pickles-push
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
