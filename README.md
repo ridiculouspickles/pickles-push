@@ -69,12 +69,35 @@ Configuration is environment variables:
 | `PICKLES_PUSH_APNS_KEY_ID` | the key's ten-character id |
 | `PICKLES_PUSH_APNS_TEAM_ID` | the team id |
 | `PICKLES_PUSH_GMAIL_AUDIENCE` | expected `aud` of the Pub/Sub OIDC token; unset disables Gmail |
+| `PICKLES_PUSH_REGISTRATION_SECRET` | a secret you choose and type into Pickles beside this relay's URL; **set this if you run your own** |
+| `PICKLES_PUSH_SUBSCRIPTION_PRODUCTS` | StoreKit product ids whose signed transaction admits a device; what *our* sites set |
+| `PICKLES_PUSH_SUBSCRIPTION_GRACE` | how long past its expiry a subscription still counts, default `72h` |
 
 Put a TLS terminator in front of it. The push URL is a bearer capability in a path, and
 over plain http it is a capability anyone on the wire can copy.
 
 Each site gets its own hostname and its own `PICKLES_PUSH_PUBLIC_URL`. **They must not
 share an address.** The sites never talk to each other and have nothing to synchronise.
+
+### Who may register
+
+Three ways to run it, and the difference is one environment variable:
+
+- **Yours.** Set `PICKLES_PUSH_REGISTRATION_SECRET` to anything long and random, and
+  enter the same secret in Pickles beside the relay's URL. The device sends it as a
+  bearer token; the relay compares it in constant time and stores nothing.
+- **Ours.** The sites we run set `PICKLES_PUSH_SUBSCRIPTION_PRODUCTS` instead. A device
+  presents StoreKit's signed transaction for the Pickles Push subscription; the relay
+  checks the certificate chain to Apple Root CA G3 (embedded), the signature, the
+  bundle, the product and the expiry — offline, with no call to Apple, no account and
+  nothing kept but the expiry. A capability, not an identity. The subscription is the
+  hosting, not the software: the app is free and this program is AGPL.
+- **Open.** Neither set. Anyone may register; the log says so at start. Fine on a
+  laptop, not on the internet.
+
+Both set means either proof admits a device. A lapsed subscription is not deleted;
+its pushes are skipped until the device re-registers with a renewed transaction, so a
+renewal picks up the same token and the provider-side subscription with it.
 
 ### The store
 
@@ -92,17 +115,18 @@ to a healthy start while silently dropping every device.
 Four endpoints, all JSON.
 
 ```
-POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, token?}
-                             → {token, pushUrl}
+POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, token?, transaction?}
+                             Authorization: Bearer <secret>   (a self-hosted relay)
+                             → {token, pushUrl}; 403 with a reason when refused
 DELETE /v1/register/{token}  → 204, whether or not it existed
 POST   /v1/push/{token}      the JMAP PushSubscription URL; body forwarded unread
 POST   /v1/gmail             Cloud Pub/Sub push, OIDC-verified
 GET    /healthz              → {ok, registrations}
 ```
 
-`POST /v1/register` is unauthenticated by design: there is no account here to attach a
-registration to, and the only thing registering buys an attacker is the ability to have
-their own device woken. Rate-limit it at the edge anyway.
+`POST /v1/register` has no account behind it: what it checks is a proof — the secret or
+a signed subscription, see above — and the only thing registering buys an attacker is
+the ability to have their own device woken. Rate-limit it at the edge anyway.
 
 Sending `token` back on re-registration keeps the same delivery token, which is what lets
 a device keep one provider-side subscription for its lifetime instead of recreating it
@@ -114,7 +138,10 @@ every time the app comes to the foreground.
 go test ./...
 ```
 
-The APNs tests generate a key and verify the JWT against it, including the fixed-width
+The entitlement tests build a certificate chain shaped like Apple's — root, WWDR-marked
+intermediate, App Store-marked leaf — sign transactions with it, and check that every
+claim is enforced and that a home-made chain is nothing against Apple's real root. The
+APNs tests generate a key and verify the JWT against it, including the fixed-width
 `r||s` encoding Apple is strict about and no error message ever explains. The store tests
 cover concurrent writers, because a JSON file as a datastore is only defensible if the
 locking is right. The relay tests assert that a payload reaches Apple byte-identical and
@@ -122,4 +149,8 @@ that health leaks no device token.
 
 ## Licence
 
-MIT.
+AGPL-3.0-or-later. Copyright 2026 Charlie Allom.
+
+Chosen so that anyone may run this — for themselves, their family, their company — and
+nobody may sell it as a hosted service without publishing their changes. The reasoning
+is docs/12 in the pickles-email repository.

@@ -16,6 +16,15 @@
 //	PICKLES_PUSH_APNS_TEAM_ID   the team id
 //	PICKLES_PUSH_GMAIL_AUDIENCE expected `aud` of the Cloud Pub/Sub OIDC token;
 //	                            unset disables the Gmail endpoint entirely
+//
+// Who may register (ADR-0018), one or both, or neither for an open relay:
+//
+//	PICKLES_PUSH_REGISTRATION_SECRET   a secret the operator types into the app beside
+//	                                   this relay's URL; the self-hoster's way in
+//	PICKLES_PUSH_SUBSCRIPTION_PRODUCTS comma-separated StoreKit product ids whose signed
+//	                                   transaction proves a subscription; the hosted way in
+//	PICKLES_PUSH_SUBSCRIPTION_GRACE    how long past expiry a subscription still counts
+//	                                   (default 72h)
 package main
 
 import (
@@ -29,9 +38,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yeled/pickles-push/internal/apns"
-	"github.com/yeled/pickles-push/internal/relay"
-	"github.com/yeled/pickles-push/internal/store"
+	"github.com/ridiculouspickles/pickles-push/internal/apns"
+	"github.com/ridiculouspickles/pickles-push/internal/entitlement"
+	"github.com/ridiculouspickles/pickles-push/internal/relay"
+	"github.com/ridiculouspickles/pickles-push/internal/store"
 )
 
 func main() {
@@ -79,12 +89,38 @@ func run(log *slog.Logger) error {
 		log.Info("gmail endpoint disabled: PICKLES_PUSH_GMAIL_AUDIENCE is unset")
 	}
 
+	policy := entitlement.Policy{Secret: os.Getenv("PICKLES_PUSH_REGISTRATION_SECRET")}
+	if products := os.Getenv("PICKLES_PUSH_SUBSCRIPTION_PRODUCTS"); products != "" {
+		grace := 72 * time.Hour
+		if text := os.Getenv("PICKLES_PUSH_SUBSCRIPTION_GRACE"); text != "" {
+			if grace, err = time.ParseDuration(text); err != nil {
+				return errors.New("PICKLES_PUSH_SUBSCRIPTION_GRACE is not a duration")
+			}
+		}
+		policy.Apple = &entitlement.AppleVerifier{
+			ProductIDs: strings.Split(products, ","),
+			Grace:      grace,
+		}
+	}
+	switch {
+	case policy.Open():
+		log.Warn("registration is open: set PICKLES_PUSH_REGISTRATION_SECRET (yours) or " +
+			"PICKLES_PUSH_SUBSCRIPTION_PRODUCTS (ours) so that not everyone may register")
+	case policy.Apple != nil && policy.Secret != "":
+		log.Info("registration takes a subscription or the secret")
+	case policy.Apple != nil:
+		log.Info("registration takes a subscription")
+	default:
+		log.Info("registration takes the secret")
+	}
+
 	service := &relay.Relay{
 		Store:         registrations,
 		Pusher:        apns.NewClient(key),
 		Log:           log,
 		PublicURL:     publicURL,
 		GmailAudience: gmailAudience,
+		Policy:        policy,
 	}
 
 	server := &http.Server{

@@ -1,3 +1,3 @@
-module github.com/yeled/pickles-push
+module github.com/ridiculouspickles/pickles-push
 
 go 1.24

@@ -19,8 +19,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yeled/pickles-push/internal/apns"
-	"github.com/yeled/pickles-push/internal/store"
+	"github.com/ridiculouspickles/pickles-push/internal/apns"
+	"github.com/ridiculouspickles/pickles-push/internal/entitlement"
+	"github.com/ridiculouspickles/pickles-push/internal/store"
 )
 
 // maxPayload caps what we will read from a provider.
@@ -47,6 +48,9 @@ type Relay struct {
 	// GmailAudience, when set, is the expected `aud` of the OIDC token Cloud Pub/Sub
 	// sends. Empty disables Gmail entirely.
 	GmailAudience string
+	// Policy is who may register: a subscriber, a holder of this relay's secret, or
+	// anyone. See package entitlement.
+	Policy entitlement.Policy
 }
 
 func (r *Relay) now() time.Time {
@@ -78,6 +82,10 @@ type registerRequest struct {
 	// of its subscription, because changing it would mean recreating the subscription
 	// at the provider on every foreground.
 	Token string `json:"token,omitempty"`
+	// Transaction is StoreKit's signed transaction for the push subscription, sent to
+	// a relay that sells one. A self-hosted relay is given its secret in the
+	// Authorization header instead, and an open relay needs neither.
+	Transaction string `json:"transaction,omitempty"`
 }
 
 type registerResponse struct {
@@ -87,10 +95,11 @@ type registerResponse struct {
 
 // handleRegister creates or refreshes a registration.
 //
-// Deliberately unauthenticated. There is no account here to attach it to, and the only
-// thing an attacker gains by registering is the ability to have their own device woken
-// up. What must not happen is *unbounded* registration, which is what the rate limiter in
-// front of this is for.
+// There is no account here to attach it to. What the policy checks is a *proof* — a
+// signed subscription, or this relay's secret — and having checked it the relay keeps
+// nothing but the expiry. The only thing an attacker gains by registering is the
+// ability to have their own device woken up; what must not happen is *unbounded*
+// registration, which is what the rate limiter in front of this is for.
 func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	var body registerRequest
 	if err := json.NewDecoder(io.LimitReader(request.Body, maxPayload)).Decode(&body); err != nil {
@@ -122,6 +131,13 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	now := r.now()
+	admission, err := r.Policy.Admit(request.Header.Get("Authorization"), body.Transaction,
+		body.Topic, body.Sandbox, now)
+	if err != nil {
+		// The message names what was missing, never what was sent.
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	registration := store.Registration{
 		Token:        token,
 		DeviceToken:  body.DeviceToken,
@@ -130,6 +146,7 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		Mode:         mode,
 		GmailAddress: body.GmailAddress,
 		SeenAt:       now,
+		ExpiresAt:    admission.ExpiresAt,
 	}
 	if err := r.Store.Put(registration); err != nil {
 		// Never the value: an error from Put can quote what it was given.
@@ -265,6 +282,13 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 // notification locally before it is shown. If the extension fails or runs out of its
 // thirty seconds, the reader sees "New mail", which is true and says nothing.
 func (r *Relay) deliver(ctx context.Context, registration store.Registration, payload []byte) {
+	if !registration.ExpiresAt.IsZero() && !r.now().Before(registration.ExpiresAt) {
+		// The subscription ran out and the device has not re-registered with a renewed
+		// one. Nothing is sent; the row stays until Prune, so a late renewal picks up
+		// the same token and the provider-side subscription with it.
+		r.Log.Info("skipped a push for a lapsed registration")
+		return
+	}
 	background := registration.Mode == store.Background
 	aps := map[string]any{}
 	if background {

@@ -76,6 +76,12 @@ type Registration struct {
 	CreatedAt time.Time `json:"createdAt"`
 	// SeenAt is refreshed by re-registration. It is what Prune reads.
 	SeenAt time.Time `json:"seenAt"`
+
+	// ExpiresAt is when the proof this device registered with runs out — a
+	// subscription's expiry plus the grace — after which nothing is delivered to it.
+	// Zero when the proof does not expire (a self-hoster's secret, or an open relay).
+	// The device moves it by re-registering with a renewed transaction.
+	ExpiresAt time.Time `json:"expiresAt,omitzero"`
 }
 
 // ErrNotFound is returned for an unknown token. Callers must not distinguish it from a

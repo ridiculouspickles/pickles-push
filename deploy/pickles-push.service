@@ -23,6 +23,10 @@ Environment=PICKLES_PUSH_APNS_KEY_ID=CHANGEME
 Environment=PICKLES_PUSH_APNS_TEAM_ID=CHANGEME
 # Unset to disable the Gmail endpoint entirely.
 #Environment=PICKLES_PUSH_GMAIL_AUDIENCE=https://push-a.example.com/v1/gmail
+# Who may register. Running your own: set a secret and type it into Pickles beside
+# the relay's URL. Our sites set the product ids instead. Neither means anyone.
+#Environment=PICKLES_PUSH_REGISTRATION_SECRET=CHANGEME
+#Environment=PICKLES_PUSH_SUBSCRIPTION_PRODUCTS=com.evilforbeginners.Pickles.push.yearly
 
 # It forwards bytes. It has no business doing anything else.
 StateDirectory=pickles-push

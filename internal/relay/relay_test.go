@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yeled/pickles-push/internal/apns"
-	"github.com/yeled/pickles-push/internal/store"
+	"github.com/ridiculouspickles/pickles-push/internal/apns"
+	"github.com/ridiculouspickles/pickles-push/internal/store"
 )
 
 type recordingPusher struct {
@@ -290,5 +290,50 @@ func TestValidTokenShape(t *testing.T) {
 		if validToken(bad) {
 			t.Fatalf("%q should not have passed", bad)
 		}
+	}
+}
+
+func TestASecretGuardsRegistration(t *testing.T) {
+	r, _ := newRelay(t)
+	r.Policy.Secret = "hunter2"
+	refused := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(goodRegistration))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, refused)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("without the secret: %d", recorder.Code)
+	}
+	if r.Store.Count() != 0 {
+		t.Fatal("a refused registration must not be stored")
+	}
+	admitted := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(goodRegistration))
+	admitted.Header.Set("Authorization", "Bearer hunter2")
+	recorder = httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, admitted)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("with the secret: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestALapsedRegistrationGetsNothing(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, goodRegistration)
+	registration, err := r.Store.Get(response.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration.ExpiresAt = time.Now().Add(-time.Minute)
+	if err := r.Store.Put(registration); err != nil {
+		t.Fatal(err)
+	}
+	push := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("ciphertext"))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, push)
+	if recorder.Code != http.StatusOK {
+		// The provider is still told 200: a lapsed subscriber's server should not
+		// retry, and the subscription should survive a renewal.
+		t.Fatalf("push returned %d", recorder.Code)
+	}
+	if len(pusher.all()) != 0 {
+		t.Fatal("nothing should reach Apple for a lapsed registration")
 	}
 }
