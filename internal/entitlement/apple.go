@@ -39,6 +39,19 @@ type AppleVerifier struct {
 	// for a day or two across a renewal; the grace is what keeps its push alive
 	// meanwhile.
 	Grace time.Duration
+	// AllowSandbox admits a Sandbox StoreKit transaction from a device registered for
+	// production APNs.
+	//
+	// **This is what TestFlight needs, and it is off by default.** A TestFlight build
+	// is a Release build, so it registers for the production APNs environment -- but
+	// every purchase made in TestFlight is a Sandbox one. Tying the two together, which
+	// is the obvious reading, refuses the first tester who ever subscribes, and the
+	// symptom is push that took a subscription and then stayed silent.
+	//
+	// It is a deliberate hole while it is open: a Sandbox transaction costs nobody
+	// anything, so anyone who can build against this bundle id can mint one. Turn it
+	// off when the beta ends.
+	AllowSandbox bool
 }
 
 // Transaction is the part of the payload the relay reads.
@@ -187,7 +200,12 @@ func (v *AppleVerifier) Verify(jws, bundleID string, sandbox bool, now time.Time
 	if sandbox {
 		wanted = "Sandbox"
 	}
-	if tx.Environment != wanted {
+	// A Sandbox transaction from a production registration is what every TestFlight
+	// tester has; see AllowSandbox. Nothing else is ever admitted from the wrong
+	// environment -- a Production transaction offered to a sandbox registration is
+	// still refused, because that direction is not a beta, it is a mistake.
+	sandboxException := v.AllowSandbox && tx.Environment == "Sandbox"
+	if tx.Environment != wanted && !sandboxException {
 		return tx, fmt.Errorf("transaction is from the %s environment", strings.ToLower(tx.Environment))
 	}
 	if !now.Before(tx.Expires.Add(v.Grace)) {

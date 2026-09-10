@@ -24,6 +24,9 @@
 //	PICKLES_PUSH_SUBSCRIPTION_PRODUCTS comma-separated StoreKit product ids whose signed
 //	                                   transaction proves a subscription; the hosted way in
 //	PICKLES_PUSH_SUBSCRIPTION_GRACE    how long past expiry a subscription still counts
+//	PICKLES_PUSH_ALLOW_SANDBOX         "1" admits Sandbox StoreKit transactions from
+//	                                   production registrations. TestFlight needs this;
+//	                                   a shipped relay should not have it.
 //	                                   (default 72h)
 package main
 
@@ -97,9 +100,16 @@ func run(log *slog.Logger) error {
 				return errors.New("PICKLES_PUSH_SUBSCRIPTION_GRACE is not a duration")
 			}
 		}
+		allowSandbox := os.Getenv("PICKLES_PUSH_ALLOW_SANDBOX") == "1"
+		if allowSandbox {
+			log.Warn("sandbox subscriptions are admitted: every TestFlight purchase is one, " +
+				"and so is every free one anybody can mint. Unset PICKLES_PUSH_ALLOW_SANDBOX " +
+				"when the beta ends")
+		}
 		policy.Apple = &entitlement.AppleVerifier{
-			ProductIDs: strings.Split(products, ","),
-			Grace:      grace,
+			ProductIDs:   strings.Split(products, ","),
+			Grace:        grace,
+			AllowSandbox: allowSandbox,
 		}
 	}
 	switch {

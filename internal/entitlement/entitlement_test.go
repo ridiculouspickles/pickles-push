@@ -245,3 +245,37 @@ func TestPolicy(t *testing.T) {
 		t.Fatal("a wrong secret is not rescued by a transaction")
 	}
 }
+
+// A TestFlight build is a Release build: it registers for production APNs, and every
+// purchase made in it is a Sandbox one. Tying the two together refuses the first tester
+// who ever subscribes, and the symptom is push that took a subscription and stayed
+// silent.
+func TestSandboxTransactionIsRefusedFromProductionUnlessAllowed(t *testing.T) {
+	apple := newFakeApple(t, now)
+	payload := goodPayload(now.Add(24 * time.Hour))
+	payload["environment"] = "Sandbox"
+	signed := apple.sign(t, payload)
+
+	strict := verifier(apple)
+	if _, err := strict.Verify(signed, "com.evilforbeginners.Pickles", false, now); err == nil {
+		t.Fatal("a sandbox transaction must not be admitted by default")
+	}
+
+	lenient := verifier(apple)
+	lenient.AllowSandbox = true
+	if _, err := lenient.Verify(signed, "com.evilforbeginners.Pickles", false, now); err != nil {
+		t.Fatalf("with AllowSandbox a TestFlight purchase must be admitted: %v", err)
+	}
+}
+
+// The exception runs one way only. A production transaction offered by a development
+// build is not a beta, it is a mistake.
+func TestProductionTransactionIsStillRefusedFromSandbox(t *testing.T) {
+	apple := newFakeApple(t, now)
+	signed := apple.sign(t, goodPayload(now.Add(24*time.Hour)))
+	lenient := verifier(apple)
+	lenient.AllowSandbox = true
+	if _, err := lenient.Verify(signed, "com.evilforbeginners.Pickles", true, now); err == nil {
+		t.Fatal("a production transaction must not be admitted to a sandbox registration")
+	}
+}
