@@ -295,11 +295,16 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 	registrations := r.Store.ByGmail(notification.EmailAddress)
 	// Acknowledge either way. Pub/Sub redelivers on anything but a 2xx, and redelivering
 	// to an address nobody has registered would go on for a week.
+	// **Raw JSON, not base64.** `deliver` is what encodes the provider's bytes into
+	// the envelope's `p`, exactly as it does for a JMAP body — encoding here as well
+	// sent the device a base64 *string* where it expected the payload, so it was
+	// neither JSON to parse nor a well-formed RFC 8291 body to decrypt, and the
+	// notification service extension reported "decrypt: malformed" for every Gmail
+	// push. The JMAP path passes raw bytes and always did.
 	payload, err := json.Marshal(map[string]any{"historyId": notification.HistoryID})
 	if err == nil {
-		encoded := base64.RawURLEncoding.EncodeToString(payload)
 		for _, registration := range registrations {
-			r.deliver(request.Context(), registration, []byte(encoded))
+			r.deliver(request.Context(), registration, payload)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)

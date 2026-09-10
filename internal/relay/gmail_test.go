@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 )
@@ -33,5 +35,41 @@ func TestHistoryIDRefusesNonsense(t *testing.T) {
 	var n gmailNotification
 	if err := json.Unmarshal([]byte(`{"emailAddress":"a@example.com","historyId":true}`), &n); err == nil {
 		t.Fatal("a boolean is not a cursor")
+	}
+}
+
+// The device decodes `p` once. A Gmail payload that was encoded on the way into
+// deliver *and* again inside it arrived as a base64 string: not JSON to parse, not a
+// well-formed RFC 8291 body to decrypt, and every Gmail push reported
+// "decrypt: malformed" on the phone.
+func TestDeliverEncodesThePayloadExactlyOnce(t *testing.T) {
+	relay, pusher := newRelay(t)
+	response := register(t, relay, goodRegistration)
+	registration, err := relay.Store.Get(response.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"historyId":"9912"}`)
+	relay.deliver(context.Background(), registration, body)
+
+	sent := pusher.all()
+	if len(sent) != 1 {
+		t.Fatalf("expected one push, got %d", len(sent))
+	}
+	var envelope struct {
+		P string `json:"p"`
+	}
+	if err := json.Unmarshal(sent[0].Payload, &envelope); err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(envelope.P)
+	if err != nil {
+		t.Fatalf("p is not base64url: %v", err)
+	}
+	// One decode must yield exactly what the provider sent. A second encoding
+	// anywhere would leave more base64 here.
+	if string(raw) != string(body) {
+		t.Fatalf("p decoded to %q, want %q", raw, body)
 	}
 }
