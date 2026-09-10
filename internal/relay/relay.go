@@ -223,7 +223,29 @@ type pubsubEnvelope struct {
 
 type gmailNotification struct {
 	EmailAddress string `json:"emailAddress"`
-	HistoryID    uint64 `json:"historyId"`
+	// A number in Gmail's own notifications, a string wherever else the Gmail API
+	// renders a uint64 -- and a string in the first test message ever published to
+	// the topic, which the previous uint64 refused with a 400 that Pub/Sub then
+	// retried once a second. It is a cursor; the device treats it as opaque, so
+	// this keeps whichever spelling arrived.
+	HistoryID historyID `json:"historyId"`
+}
+
+// historyID accepts a JSON number or a JSON string and keeps it as text.
+type historyID string
+
+func (h *historyID) UnmarshalJSON(b []byte) error {
+	var asString string
+	if err := json.Unmarshal(b, &asString); err == nil {
+		*h = historyID(asString)
+		return nil
+	}
+	var asNumber json.Number
+	if err := json.Unmarshal(b, &asNumber); err != nil {
+		return err
+	}
+	*h = historyID(asNumber.String())
+	return nil
 }
 
 // handleGmailPush receives a Cloud Pub/Sub push.
@@ -245,19 +267,29 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// **A message that cannot be read is acknowledged, not refused.** Pub/Sub
+	// retries anything but a 2xx, with backoff measured in seconds, for as long as
+	// the subscription retains it -- a week by default. One malformed publish
+	// answered 400 hit this endpoint six times in its first three seconds and would
+	// have gone on all week. The token was already verified above, so what arrives
+	// here came from our own topic; dropping it costs one notification that was
+	// never going to be understood, and retrying it costs everything.
 	var envelope pubsubEnvelope
 	if err := json.NewDecoder(io.LimitReader(request.Body, maxPayload)).Decode(&envelope); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		r.Log.Warn("pub/sub message dropped", "reason", "envelope not JSON")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(envelope.Message.Data)
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		r.Log.Warn("pub/sub message dropped", "reason", "data not base64")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var notification gmailNotification
 	if err := json.Unmarshal(raw, &notification); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		r.Log.Warn("pub/sub message dropped", "reason", "not a Gmail notification")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	registrations := r.Store.ByGmail(notification.EmailAddress)
