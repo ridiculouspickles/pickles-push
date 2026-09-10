@@ -154,6 +154,29 @@ func (s *Store) Put(r Registration) error {
 	}
 	r.GmailAddress = strings.ToLower(r.GmailAddress)
 	s.registrations[r.Token] = r
+
+	// **One registration per device per app, on this site.** A device that registers
+	// again under a new delivery token has replaced the old one, not acquired a second:
+	// the old row still holds a working APNs token, so a provider pushing to both URLs
+	// wakes the same device twice and the reader gets two identical banners.
+	//
+	// This is not hypothetical. A client bug minted a fresh token on every launch —
+	// registrations were written to UserDefaults and never read back — and one phone
+	// accumulated three rows on each site before anybody noticed the duplicates. The
+	// client is fixed; this is what makes the relay robust to the next one, and to a
+	// device restored from a backup, which arrives looking exactly the same.
+	//
+	// Keyed on the device token and the topic rather than the mode: a site that starts
+	// sending a device alerts instead of silent wakes has changed the same registration,
+	// not added one.
+	for token, other := range s.registrations {
+		if token == r.Token {
+			continue
+		}
+		if other.DeviceToken == r.DeviceToken && other.Topic == r.Topic {
+			delete(s.registrations, token)
+		}
+	}
 	return s.flushLocked()
 }
 

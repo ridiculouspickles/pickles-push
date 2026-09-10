@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -8,10 +10,14 @@ import (
 	"time"
 )
 
+// The device token is derived from the delivery token so that two fixtures are two
+// *devices*. They used to share one, which stopped being expressible when Put began
+// keeping a single registration per device per app: a second Put simply replaced the
+// first, and a test about pruning found nothing left to prune.
 func newRegistration(token string) Registration {
 	return Registration{
 		Token:       token,
-		DeviceToken: "abcdef0123456789abcdef0123456789",
+		DeviceToken: fmt.Sprintf("%064x", sha256.Sum256([]byte(token)))[:64],
 		Topic:       "net.pickles.mail.dev",
 		Mode:        Alert,
 		SeenAt:      time.Now(),
@@ -195,5 +201,61 @@ func TestFileIsNotWorldReadable(t *testing.T) {
 	// there is no reason for anything else on the box to read it.
 	if mode := info.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("expected 0600, got %o", mode)
+	}
+}
+
+// A device that registers again under a new delivery token has replaced the old one,
+// not acquired a second. The old row still holds a working APNs token, so leaving it
+// there wakes the same device twice for one message — which is exactly what a client
+// bug produced: three rows on each site for one phone, and three identical banners.
+func TestRegisteringAgainReplacesTheDevicesOtherRegistrations(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "registrations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Registration{DeviceToken: "aaaa", Topic: "net.pickles.mail.dev", Mode: Alert, SeenAt: time.Now()}
+
+	first := base
+	first.Token = "tok-one"
+	if err := s.Put(first); err != nil {
+		t.Fatal(err)
+	}
+	second := base
+	second.Token = "tok-two"
+	if err := s.Put(second); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.Count(); got != 1 {
+		t.Fatalf("one device should hold one registration, got %d", got)
+	}
+	if _, err := s.Get("tok-two"); err != nil {
+		t.Fatal("the newest registration must be the one kept")
+	}
+	if _, err := s.Get("tok-one"); err == nil {
+		t.Fatal("the superseded registration must be gone")
+	}
+}
+
+// Another device, and the same device under another app, are not duplicates.
+func TestOtherDevicesAndOtherAppsAreLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "registrations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []Registration{
+		{Token: "a", DeviceToken: "aaaa", Topic: "net.pickles.mail.dev", Mode: Alert, SeenAt: time.Now()},
+		{Token: "b", DeviceToken: "bbbb", Topic: "net.pickles.mail.dev", Mode: Alert, SeenAt: time.Now()},
+		{Token: "c", DeviceToken: "aaaa", Topic: "com.evilforbeginners.Pickles", Mode: Alert, SeenAt: time.Now()},
+	}
+	for _, r := range rows {
+		if err := s.Put(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := s.Count(); got != 3 {
+		t.Fatalf("three distinct registrations, got %d", got)
 	}
 }
