@@ -337,3 +337,17 @@ func TestALapsedRegistrationGetsNothing(t *testing.T) {
 		t.Fatal("nothing should reach Apple for a lapsed registration")
 	}
 }
+
+// A JMAP push naming a token the relay has never held is the shape of a subscription
+// that outlived its device registration. It answers 404 -- never 410, which would have
+// the provider destroy the subscription while a device is mid-re-registration.
+func TestJMAPPushForAnUnknownTokenIsNotFound(t *testing.T) {
+	relay, _ := newRelay(t)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		"POST", "/v1/push/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", strings.NewReader("{}"))
+	relay.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("want 404 for an unknown delivery token, got %d", recorder.Code)
+	}
+}

@@ -194,6 +194,13 @@ func (r *Relay) handleJMAPPush(w http.ResponseWriter, request *http.Request) {
 	}
 	registration, err := r.Store.Get(token)
 	if err != nil {
+		// Worth a line, and it is the only line this endpoint gets. A JMAP server
+		// delivering to a token we do not hold is the shape of a subscription that
+		// outlived its registration -- the device reinstalled, Apple reported its old
+		// token gone, and the provider is still pushing into a hole. Nothing about the
+		// request is logged: the token in the path is a bearer capability, and Apache
+		// is configured not to log these URLs for exactly that reason.
+		r.Log.Info("jmap push for a delivery token we do not hold")
 		// 404 rather than 410: a device that is mid-re-registration should not cause its
 		// provider to tear the subscription down.
 		http.Error(w, "not found", http.StatusNotFound)
