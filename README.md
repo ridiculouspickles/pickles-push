@@ -68,7 +68,8 @@ Configuration is environment variables:
 | `PICKLES_PUSH_APNS_KEY` | path to the `.p8` from the developer portal |
 | `PICKLES_PUSH_APNS_KEY_ID` | the key's ten-character id |
 | `PICKLES_PUSH_APNS_TEAM_ID` | the team id |
-| `PICKLES_PUSH_GMAIL_AUDIENCE` | expected `aud` of the Pub/Sub OIDC token; unset disables Gmail |
+| `PICKLES_PUSH_GMAIL_AUDIENCE` | expected `aud` of the Pub/Sub OIDC token; unset disables Gmail. A long random string rather than the endpoint URL, set as the push subscription's audience |
+| `PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT` | the service account the push subscription mints its tokens for; **unset also disables Gmail**, because any Google Cloud project can mint a token for any audience |
 | `PICKLES_PUSH_REGISTRATION_SECRET` | a secret you choose and type into Pickles beside this relay's URL; **set this if you run your own** |
 | `PICKLES_PUSH_SUBSCRIPTION_PRODUCTS` | StoreKit product ids whose signed transaction admits a device; what *our* sites set |
 | `PICKLES_PUSH_SUBSCRIPTION_GRACE` | how long past its expiry a subscription still counts, default `72h` |

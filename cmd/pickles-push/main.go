@@ -16,6 +16,9 @@
 //	PICKLES_PUSH_APNS_TEAM_ID   the team id
 //	PICKLES_PUSH_GMAIL_AUDIENCE expected `aud` of the Cloud Pub/Sub OIDC token;
 //	                            unset disables the Gmail endpoint entirely
+//	PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT
+//	                            the service account the push subscription mints its
+//	                            tokens for; without it the Gmail endpoint stays closed
 //
 // Who may register (ADR-0018), one or both, or neither for an open relay:
 //
@@ -88,8 +91,15 @@ func run(log *slog.Logger) error {
 	}
 
 	gmailAudience := os.Getenv("PICKLES_PUSH_GMAIL_AUDIENCE")
-	if gmailAudience == "" {
+	gmailServiceAccount := os.Getenv("PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT")
+	switch {
+	case gmailAudience == "":
 		log.Info("gmail endpoint disabled: PICKLES_PUSH_GMAIL_AUDIENCE is unset")
+	case gmailServiceAccount == "":
+		// Closed rather than half-open. Signature, audience and expiry are all a token
+		// from anybody's Google Cloud project needs to pass.
+		log.Error("gmail endpoint disabled: PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT is unset, " +
+			"and without it a token minted for any Google account would be believed")
 	}
 
 	policy := entitlement.Policy{Secret: os.Getenv("PICKLES_PUSH_REGISTRATION_SECRET")}
@@ -125,12 +135,13 @@ func run(log *slog.Logger) error {
 	}
 
 	service := &relay.Relay{
-		Store:         registrations,
-		Pusher:        apns.NewClient(key),
-		Log:           log,
-		PublicURL:     publicURL,
-		GmailAudience: gmailAudience,
-		Policy:        policy,
+		Store:               registrations,
+		Pusher:              apns.NewClient(key),
+		Log:                 log,
+		PublicURL:           publicURL,
+		GmailAudience:       gmailAudience,
+		GmailServiceAccount: gmailServiceAccount,
+		Policy:              policy,
 	}
 
 	server := &http.Server{

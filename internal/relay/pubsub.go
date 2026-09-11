@@ -21,7 +21,12 @@ import (
 //
 // Without this the Gmail endpoint is an open door: anyone who guesses the URL could
 // claim any address has new mail and wake somebody's phone all night. Google signs an
-// OIDC token with its own keys; we check the signature, the audience and the expiry.
+// OIDC token with its own keys; we check the signature, the audience, the expiry, and
+// the account Google minted it for.
+//
+// The last is the one that matters. A signature says Google minted the token, not that
+// our subscription asked it to: `gcloud auth print-identity-token --audiences=<url>`
+// mints one for any audience from any project, and the audience is a URL.
 //
 // Hand-rolled, like the APNs JWT, because pulling in a JWT library and a Google SDK to
 // verify one RS256 token would be a supply chain several times the size of the program.
@@ -110,6 +115,16 @@ func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 	return nil, fmt.Errorf("unknown signing key %q", kid)
 }
 
+// claimIsTrue reads a boolean claim that some issuers write as the string "true".
+func claimIsTrue(raw json.RawMessage) bool {
+	var asBool bool
+	if json.Unmarshal(raw, &asBool) == nil {
+		return asBool
+	}
+	var asString string
+	return json.Unmarshal(raw, &asString) == nil && asString == "true"
+}
+
 func bigEndianUint(b []byte) uint64 {
 	padded := make([]byte, 8)
 	if len(b) > 8 {
@@ -168,15 +183,24 @@ func (r *Relay) verifyPubSub(request *http.Request) error {
 		return err
 	}
 	var claims struct {
-		Aud string `json:"aud"`
-		Iss string `json:"iss"`
-		Exp int64  `json:"exp"`
+		Aud           string          `json:"aud"`
+		Iss           string          `json:"iss"`
+		Exp           int64           `json:"exp"`
+		Email         string          `json:"email"`
+		EmailVerified json.RawMessage `json:"email_verified"`
 	}
 	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
 		return err
 	}
 	if claims.Aud != r.GmailAudience {
 		return errors.New("wrong audience")
+	}
+	// Google's documented check for an authenticated push endpoint. Never the claimed
+	// address in the error: it was written by whoever minted the token.
+	if r.GmailServiceAccount == "" ||
+		!strings.EqualFold(claims.Email, r.GmailServiceAccount) ||
+		!claimIsTrue(claims.EmailVerified) {
+		return errors.New("token was not minted for this relay's service account")
 	}
 	issuerOK := false
 	for _, issuer := range googleIssuers {
