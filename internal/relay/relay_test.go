@@ -250,6 +250,7 @@ func TestGmailEndpointIsClosedUnlessConfigured(t *testing.T) {
 func TestGmailEndpointRefusesAnUnsignedRequest(t *testing.T) {
 	r, pusher := newRelay(t)
 	r.GmailAudience = "https://push-a.example.com/v1/gmail"
+	r.GmailServiceAccount = "push@pickles-email.iam.gserviceaccount.com"
 	r.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
 
 	body := `{"message":{"data":"eyJlbWFpbEFkZHJlc3MiOiJhQGdtYWlsLmNvbSIsImhpc3RvcnlJZCI6MX0="}}`

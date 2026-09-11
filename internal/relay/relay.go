@@ -48,6 +48,11 @@ type Relay struct {
 	// GmailAudience, when set, is the expected `aud` of the OIDC token Cloud Pub/Sub
 	// sends. Empty disables Gmail entirely.
 	GmailAudience string
+	// GmailServiceAccount is the account the Pub/Sub push subscription has Google mint
+	// its tokens for. A valid signature proves only that Google minted a token, and
+	// anyone with a Google Cloud project can have one minted for any audience; this is
+	// the claim that says it was ours. Empty keeps the Gmail endpoint closed too.
+	GmailServiceAccount string
 	// Policy is who may register: a subscriber, a holder of this relay's secret, or
 	// anyone. See package entitlement.
 	Policy entitlement.Policy
@@ -265,7 +270,7 @@ func (h *historyID) UnmarshalJSON(b []byte) error {
 // See ADR-0017. The honest sentence is "on JMAP the relay cannot identify you; on Gmail
 // it knows your address and nothing else."
 func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
-	if r.GmailAudience == "" {
+	if r.GmailAudience == "" || r.GmailServiceAccount == "" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
