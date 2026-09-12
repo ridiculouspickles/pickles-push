@@ -267,19 +267,26 @@ func TestGmailEndpointRefusesAnUnsignedRequest(t *testing.T) {
 	}
 }
 
-func TestHealthReportsACountAndNothingElse(t *testing.T) {
+// Health says the process is up, and nothing about who it is serving. It used to
+// report the number of registrations — a subscriber count, on the one endpoint that is
+// deliberately unauthenticated so a monitor can reach it (pickles-email#476).
+func TestHealthSaysOnlyThatItIsUp(t *testing.T) {
 	r, _ := newRelay(t)
 	register(t, r, goodRegistration)
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	recorder := httptest.NewRecorder()
 	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("health returned %d", recorder.Code)
+	}
 	body := recorder.Body.String()
-	if !strings.Contains(body, `"registrations":1`) {
+	if !strings.Contains(body, `"ok":true`) {
 		t.Fatalf("health said %q", body)
 	}
-	// It is a number, not a listing: health checks end up in logs and dashboards.
-	if strings.Contains(body, "abcdef0123456789") {
-		t.Fatal("health leaked a device token")
+	for _, leak := range []string{"registrations", "abcdef0123456789"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("health leaked %q: %s", leak, body)
+		}
 	}
 }
 
@@ -376,5 +383,41 @@ func TestAnUnknownModeIsRefusedWithoutLoggingIt(t *testing.T) {
 	}
 	if r.Store.Count() != 0 {
 		t.Fatal("a registration with no usable mode was stored anyway")
+	}
+}
+
+// A registration is not a StateChange and does not fit in a StateChange's budget: a real
+// StoreKit signed transaction carries its certificate chain, about 6 KB of the 8 KiB the
+// two used to share, and one more certificate from Apple would have taken it over
+// (pickles-email#476 item 5).
+func TestARegistrationMayBeLargerThanAStateChange(t *testing.T) {
+	r, _ := newRelay(t)
+	// Bigger than maxPayload, smaller than maxRegistration. The relay is open here, so
+	// the transaction is not read — this is about what may be *sent*.
+	body := `{"deviceToken":"abcdef0123456789abcdef0123456789","topic":"net.pickles.mail.dev",` +
+		`"transaction":"` + strings.Repeat("j", 12<<10) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("a 12 KiB registration returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	// There is still a limit, and it says which limit it was.
+	var log strings.Builder
+	r.Log = slog.New(slog.NewTextHandler(&log, nil))
+	huge := `{"deviceToken":"abcdef0123456789abcdef0123456789","topic":"net.pickles.mail.dev",` +
+		`"transaction":"` + strings.Repeat("j", 64<<10) + `"}`
+	request = httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(huge))
+	recorder = httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a 64 KiB registration returned %d", recorder.Code)
+	}
+	if !strings.Contains(log.String(), "registration refused") {
+		t.Fatalf("the refusal was not distinguishable in the log: %q", log.String())
+	}
+	if strings.Contains(log.String(), "jjjj") {
+		t.Fatal("the body reached the log")
 	}
 }

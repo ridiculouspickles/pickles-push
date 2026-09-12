@@ -31,6 +31,15 @@ import (
 // it.
 const maxPayload = 8 << 10
 
+// maxRegistration is what we will read from a device registering.
+//
+// Its own limit, because a registration is a different shape from a StateChange: a real
+// StoreKit signed transaction carries its certificate chain, which is about 6 KB of the
+// 8 KiB a StateChange was sized for, and one extra certificate from Apple would have
+// taken it over. A registration is also the one request here that a device retries
+// rather than a provider (pickles-email#476 item 5).
+const maxRegistration = 32 << 10
+
 // Pusher is the half of apns.Client this package uses, so tests need no network.
 type Pusher interface {
 	Push(ctx context.Context, n apns.Notification) error
@@ -106,8 +115,23 @@ type registerResponse struct {
 // ability to have their own device woken up; what must not happen is *unbounded*
 // registration, which is what the rate limiter in front of this is for.
 func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(request.Body, maxRegistration+1))
+	if err != nil {
+		r.Log.Warn("registration refused", "reason", "the body could not be read")
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(raw) > maxRegistration {
+		// Its own reason, and its own status. Sharing maxPayload's meant a registration
+		// that had grown too big was indistinguishable in the log from a provider
+		// sending nonsense.
+		r.Log.Warn("registration refused", "reason", "body is larger than the registration limit")
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var body registerRequest
-	if err := json.NewDecoder(io.LimitReader(request.Body, maxPayload)).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
+		r.Log.Warn("registration refused", "reason", "body is not JSON")
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -132,7 +156,6 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	}
 	token := body.Token
 	if token == "" {
-		var err error
 		if token, err = newToken(); err != nil {
 			r.Log.Error("token generation failed", "error", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -145,6 +168,14 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	now := r.now()
 	admission, err := r.Policy.Admit(request.Header.Get("Authorization"), body.Transaction,
 		body.Topic, body.Sandbox, now)
+	if err == nil && !admission.Signed.IsZero() {
+		// Days, not the date, and nothing about which device. This is here to answer a
+		// question the code cannot: how old a signed transaction a real device actually
+		// presents, which is what AppleVerifier.MaxSignedAge needs before it is worth
+		// enforcing (pickles-email#476 item 4). It can go once that is known.
+		r.Log.Info("admitted a subscription",
+			"signedDaysAgo", int(now.Sub(admission.Signed).Hours()/24))
+	}
 	if err != nil {
 		// The message names what was missing, never what was sent.
 		http.Error(w, err.Error(), http.StatusForbidden)
@@ -388,10 +419,12 @@ func (r *Relay) deliver(ctx context.Context, registration store.Registration, pa
 }
 
 func (r *Relay) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":            true,
-		"registrations": r.Store.Count(),
-	})
+	// Liveness and nothing else. It used to report the number of registrations, which
+	// is a subscriber count answered to anybody who asks, on an endpoint deliberately
+	// left unauthenticated so a monitor can reach it (pickles-email#476). The same
+	// number is in the startup line and in the store file on the host, which is where
+	// an operator already has to be to read it.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ---------------------------------------------------------------- helpers

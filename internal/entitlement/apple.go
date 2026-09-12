@@ -52,6 +52,21 @@ type AppleVerifier struct {
 	// anything, so anyone who can build against this bundle id can mint one. Turn it
 	// off when the beta ends.
 	AllowSandbox bool
+	// MaxSignedAge is how old Apple's signature on the transaction may be. Zero does
+	// not check it.
+	//
+	// `revocationDate` is only in the JWS if it was there when Apple signed it, so a
+	// refunded subscriber can present the *pre-refund* JWS until its expiry plus the
+	// grace and be admitted every time. Requiring a recent signature forces the device
+	// to bring a re-signed transaction, which carries the revocation — and bounds how
+	// long a leaked JWS is worth anything (pickles-email#476 item 4).
+	//
+	// **Left at zero until we know what real devices present.** A window shorter than
+	// StoreKit's own refresh interval refuses a paying subscriber and the symptom is
+	// silence, which is the failure this whole component is written to avoid. Verify
+	// reports the age on every admission so the distribution can be read off the log
+	// first.
+	MaxSignedAge time.Duration
 }
 
 // Transaction is the part of the payload the relay reads.
@@ -61,6 +76,9 @@ type Transaction struct {
 	Type        string
 	Environment string
 	Expires     time.Time
+	// Signed is when Apple signed this JWS, which is not when the subscription
+	// started. See MaxSignedAge.
+	Signed time.Time
 }
 
 //go:embed AppleRootCA-G3.pem
@@ -130,18 +148,29 @@ func (v *AppleVerifier) Verify(jws, bundleID string, sandbox bool, now time.Time
 	if roots == nil {
 		roots = AppleRoots()
 	}
-	if _, err := leaf.Verify(x509.VerifyOptions{
+	chains, err := leaf.Verify(x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: intermediates,
 		CurrentTime:   now,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-	}); err != nil {
+	})
+	if err != nil {
 		return Transaction{}, errors.New("certificate chain does not lead to Apple")
+	}
+	// **The verified chain, not the submitted one.** Verify returns the chains it
+	// actually built; checking the WWDR marker on `chain[1]` instead checked whichever
+	// certificate the client happened to put second, which is a claim rather than a
+	// finding. It has never differed in practice — Go builds the same chain the JWS
+	// carries — and that is exactly why reading the wrong one would never have shown up
+	// (pickles-email#476 item 3).
+	verified := chains[0]
+	if len(verified) < 2 {
+		return Transaction{}, errors.New("certificate chain has no intermediate")
 	}
 	if !hasExtension(leaf, oidAppStoreSigning) {
 		return Transaction{}, errors.New("signing certificate is not an App Store one")
 	}
-	if !hasExtension(chain[1], oidWWDRIntermediate) {
+	if !hasExtension(verified[1], oidWWDRIntermediate) {
 		return Transaction{}, errors.New("intermediate is not Apple Worldwide Developer Relations")
 	}
 	public, ok := leaf.PublicKey.(*ecdsa.PublicKey)
@@ -170,6 +199,7 @@ func (v *AppleVerifier) Verify(jws, bundleID string, sandbox bool, now time.Time
 		Environment    string `json:"environment"`
 		ExpiresDate    int64  `json:"expiresDate"`
 		RevocationDate int64  `json:"revocationDate"`
+		SignedDate     int64  `json:"signedDate"`
 	}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		return Transaction{}, errors.New("transaction payload is not JSON")
@@ -180,6 +210,9 @@ func (v *AppleVerifier) Verify(jws, bundleID string, sandbox bool, now time.Time
 		Type:        payload.Type,
 		Environment: payload.Environment,
 		Expires:     time.UnixMilli(payload.ExpiresDate).UTC(),
+	}
+	if payload.SignedDate != 0 {
+		tx.Signed = time.UnixMilli(payload.SignedDate).UTC()
 	}
 	if tx.BundleID != bundleID {
 		return tx, errors.New("transaction is for another app")
@@ -195,6 +228,18 @@ func (v *AppleVerifier) Verify(jws, bundleID string, sandbox bool, now time.Time
 	}
 	if payload.ExpiresDate == 0 {
 		return tx, errors.New("subscription has no expiry")
+	}
+	if v.MaxSignedAge > 0 {
+		switch {
+		case tx.Signed.IsZero():
+			return tx, errors.New("transaction does not say when it was signed")
+		case now.Sub(tx.Signed) > v.MaxSignedAge:
+			// The device has one: StoreKit re-signs on renewal and on refresh. What it
+			// is holding is old enough that a refund since would not be in it.
+			return tx, errors.New("transaction was signed too long ago; the device needs a current one")
+		case tx.Signed.After(now.Add(24 * time.Hour)):
+			return tx, errors.New("transaction is signed in the future")
+		}
 	}
 	wanted := "Production"
 	if sandbox {

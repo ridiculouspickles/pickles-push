@@ -27,10 +27,15 @@
 //	PICKLES_PUSH_SUBSCRIPTION_PRODUCTS comma-separated StoreKit product ids whose signed
 //	                                   transaction proves a subscription; the hosted way in
 //	PICKLES_PUSH_SUBSCRIPTION_GRACE    how long past expiry a subscription still counts
+//	                                   (default 72h)
+//	PICKLES_PUSH_SUBSCRIPTION_MAX_SIGNED_AGE
+//	                                   how old Apple's signature on the transaction may
+//	                                   be; unset does not check it. A refunded
+//	                                   subscriber can present the pre-refund JWS until
+//	                                   it expires, and this is what bounds that
 //	PICKLES_PUSH_ALLOW_SANDBOX         "1" admits Sandbox StoreKit transactions from
 //	                                   production registrations. TestFlight needs this;
 //	                                   a shipped relay should not have it.
-//	                                   (default 72h)
 package main
 
 import (
@@ -112,10 +117,31 @@ func run(log *slog.Logger) error {
 
 	policy := entitlement.Policy{Secret: os.Getenv("PICKLES_PUSH_REGISTRATION_SECRET")}
 	if products := os.Getenv("PICKLES_PUSH_SUBSCRIPTION_PRODUCTS"); products != "" {
+		// Trimmed, because a list written with spaces after the commas matched no
+		// product at all and said so as "transaction is for another product" — which
+		// reads like the device's fault rather than the unit file's.
+		ids := productIDs(products)
+		if len(ids) == 0 {
+			return errors.New("PICKLES_PUSH_SUBSCRIPTION_PRODUCTS is set but names no product")
+		}
 		grace := 72 * time.Hour
 		if text := os.Getenv("PICKLES_PUSH_SUBSCRIPTION_GRACE"); text != "" {
 			if grace, err = time.ParseDuration(text); err != nil {
 				return errors.New("PICKLES_PUSH_SUBSCRIPTION_GRACE is not a duration")
+			}
+			if grace < 0 {
+				// It parses, and it means every live subscription is already expired.
+				return errors.New("PICKLES_PUSH_SUBSCRIPTION_GRACE cannot be negative")
+			}
+		}
+		var maxSignedAge time.Duration
+		if text := os.Getenv("PICKLES_PUSH_SUBSCRIPTION_MAX_SIGNED_AGE"); text != "" {
+			if maxSignedAge, err = time.ParseDuration(text); err != nil {
+				return errors.New("PICKLES_PUSH_SUBSCRIPTION_MAX_SIGNED_AGE is not a duration")
+			}
+			if maxSignedAge <= 0 {
+				return errors.New("PICKLES_PUSH_SUBSCRIPTION_MAX_SIGNED_AGE must be positive; " +
+					"unset it to not check the signature's age")
 			}
 		}
 		allowSandbox := os.Getenv("PICKLES_PUSH_ALLOW_SANDBOX") == "1"
@@ -124,10 +150,20 @@ func run(log *slog.Logger) error {
 				"and so is every free one anybody can mint. Unset PICKLES_PUSH_ALLOW_SANDBOX " +
 				"when the beta ends")
 		}
+		if maxSignedAge == 0 {
+			// Said once at start rather than left to be discovered: this is the
+			// difference between "the subscription is live" and "the subscription was
+			// live when Apple last signed for it".
+			log.Info("the age of a transaction's signature is not checked: a refunded " +
+				"subscriber can present the pre-refund transaction until it expires. " +
+				"Every admission logs signedDaysAgo; set " +
+				"PICKLES_PUSH_SUBSCRIPTION_MAX_SIGNED_AGE once that number is known")
+		}
 		policy.Apple = &entitlement.AppleVerifier{
-			ProductIDs:   strings.Split(products, ","),
+			ProductIDs:   ids,
 			Grace:        grace,
 			AllowSandbox: allowSandbox,
+			MaxSignedAge: maxSignedAge,
 		}
 	}
 	switch {
@@ -208,6 +244,17 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// productIDs splits a comma-separated list and drops the whitespace and the blanks.
+func productIDs(list string) []string {
+	var ids []string
+	for _, id := range strings.Split(list, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func envOr(name, fallback string) string {

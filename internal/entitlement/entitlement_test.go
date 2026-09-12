@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,9 +24,17 @@ type fakeApple struct {
 	leaf  *x509.Certificate
 	chain []string
 	key   *ecdsa.PrivateKey
+	now   time.Time
 }
 
 func newFakeApple(t *testing.T, now time.Time) *fakeApple {
+	return newFakeAppleMarking(t, now, true)
+}
+
+// markIntermediate is false for the one test that needs a chain whose real intermediate
+// does *not* carry Apple's WWDR marker, so that a marked decoy in x5c can be told apart
+// from the certificate that actually signed the leaf.
+func newFakeAppleMarking(t *testing.T, now time.Time, markIntermediate bool) *fakeApple {
 	t.Helper()
 	newKey := func() *ecdsa.PrivateKey {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -56,7 +65,11 @@ func newFakeApple(t *testing.T, now time.Time) *fakeApple {
 		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "Fake WWDR"},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
-		ExtraExtensions: []pkix.Extension{{Id: oidWWDRIntermediate, Value: []byte{0x05, 0x00}}},
+	}
+	if markIntermediate {
+		intermediateTemplate.ExtraExtensions = []pkix.Extension{
+			{Id: oidWWDRIntermediate, Value: []byte{0x05, 0x00}},
+		}
 	}
 	intermediate := issue(intermediateTemplate, root, &intermediateKey.PublicKey, rootKey)
 	leafTemplate := &x509.Certificate{
@@ -72,7 +85,41 @@ func newFakeApple(t *testing.T, now time.Time) *fakeApple {
 	return &fakeApple{
 		roots: roots, leaf: leaf, key: leafKey,
 		chain: []string{encode(leaf), encode(intermediate), encode(root)},
+		now:   now,
 	}
+}
+
+// insertAfterLeaf puts a certificate where the intermediate goes in x5c. It changes
+// what the client claims the chain is, and nothing about who signed what.
+func (f *fakeApple) insertAfterLeaf(t *testing.T, cert *x509.Certificate) {
+	t.Helper()
+	encoded := base64.StdEncoding.EncodeToString(cert.Raw)
+	f.chain = append([]string{f.chain[0], encoded}, f.chain[1:]...)
+}
+
+// selfSignedCarrying is a certificate with a marker on it and nothing else to recommend
+// it: it signs nothing, chains to nothing, and exists only to be looked at.
+func selfSignedCarrying(t *testing.T, oid asn1.ObjectIdentifier, now time.Time) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(99), Subject: pkix.Name{CommonName: "Decoy"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+		ExtraExtensions: []pkix.Extension{{Id: oid, Value: []byte{0x05, 0x00}}},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
 }
 
 // sign produces a JWS the way StoreKit does: ES256, the chain in x5c, r||s signature.
@@ -277,5 +324,86 @@ func TestProductionTransactionIsStillRefusedFromSandbox(t *testing.T) {
 	lenient.AllowSandbox = true
 	if _, err := lenient.Verify(signed, "com.evilforbeginners.Pickles", true, now); err == nil {
 		t.Fatal("a production transaction must not be admitted to a sandbox registration")
+	}
+}
+
+// The WWDR marker has to be read off the chain Go built, not the one the client sent.
+//
+// `leaf.Verify` returns the chains it actually assembled; checking `chain[1]` instead
+// checked whichever certificate the caller put second in x5c, which is a claim and not a
+// finding. Here the certificate that really signed the leaf carries no marker and a
+// self-signed decoy that carries one sits in its place — so reading the submitted chain
+// admits it and reading the verified chain does not (pickles-email#476 item 3).
+func TestTheIntermediateIsCheckedOnTheChainGoBuilt(t *testing.T) {
+	apple := newFakeAppleMarking(t, now, false)
+	// Unmarked to begin with, so the refusal is about the marker and not something else.
+	if _, err := verifier(apple).Verify(
+		apple.sign(t, goodPayload(now.Add(300*24*time.Hour))),
+		"com.evilforbeginners.Pickles", false, now); err == nil {
+		t.Fatal("an intermediate with no WWDR marker must be refused")
+	}
+	apple.insertAfterLeaf(t, selfSignedCarrying(t, oidWWDRIntermediate, now))
+	_, err := verifier(apple).Verify(
+		apple.sign(t, goodPayload(now.Add(300*24*time.Hour))),
+		"com.evilforbeginners.Pickles", false, now)
+	if err == nil {
+		t.Fatal("a decoy in x5c satisfied the WWDR check")
+	}
+	if !strings.Contains(err.Error(), "Worldwide Developer Relations") {
+		t.Fatalf("refused, but for the wrong reason: %v", err)
+	}
+}
+
+// revocationDate is only in a JWS if it was there when Apple signed it, so the
+// transaction from before a refund stays verifiable until it expires. Requiring a recent
+// signature is what makes the device fetch one that carries the revocation — and bounds
+// how long a leaked JWS is worth anything (pickles-email#476 item 4).
+func TestAStaleSignatureIsRefusedOnlyWhenAnAgeIsSet(t *testing.T) {
+	apple := newFakeApple(t, now)
+	payload := goodPayload(now.Add(300 * 24 * time.Hour))
+	payload["signedDate"] = now.Add(-60 * 24 * time.Hour).UnixMilli()
+	jws := apple.sign(t, payload)
+
+	// Unset, which is where it ships until the log says what real devices present.
+	unchecked := verifier(apple)
+	tx, err := unchecked.Verify(jws, "com.evilforbeginners.Pickles", false, now)
+	if err != nil {
+		t.Fatalf("with no age configured a stale signature must still be admitted: %v", err)
+	}
+	if tx.Signed.IsZero() {
+		t.Fatal("the signing date was not reported, so nothing can decide what to set")
+	}
+
+	checked := verifier(apple)
+	checked.MaxSignedAge = 30 * 24 * time.Hour
+	if _, err := checked.Verify(jws, "com.evilforbeginners.Pickles", false, now); err == nil {
+		t.Fatal("a signature two months old passed a thirty-day limit")
+	}
+
+	recent := goodPayload(now.Add(300 * 24 * time.Hour))
+	recent["signedDate"] = now.Add(-time.Hour).UnixMilli()
+	if _, err := checked.Verify(apple.sign(t, recent), "com.evilforbeginners.Pickles", false, now); err != nil {
+		t.Fatalf("an hour-old signature was refused by a thirty-day limit: %v", err)
+	}
+
+	// A transaction with no signedDate at all cannot be judged, and once an age is
+	// required, "cannot be judged" is a refusal rather than a pass.
+	if _, err := checked.Verify(apple.sign(t, goodPayload(now.Add(300*24*time.Hour))),
+		"com.evilforbeginners.Pickles", false, now); err == nil {
+		t.Fatal("a transaction with no signedDate passed an age check")
+	}
+}
+
+// A wrong secret is refused whatever its length, and the comparison does not answer
+// sooner for one of those than the other (pickles-email#476, also-noted).
+func TestAWrongSecretIsRefusedAtEveryLength(t *testing.T) {
+	policy := Policy{Secret: "the-right-secret"}
+	for _, presented := range []string{"", "x", "the-right-secre", "the-right-secret-and-more", "THE-RIGHT-SECRET"} {
+		if _, err := policy.Admit("Bearer "+presented, "", "com.evilforbeginners.Pickles", false, now); err == nil {
+			t.Fatalf("admitted %q", presented)
+		}
+	}
+	if _, err := policy.Admit("Bearer the-right-secret", "", "com.evilforbeginners.Pickles", false, now); err != nil {
+		t.Fatalf("the right secret was refused: %v", err)
 	}
 }

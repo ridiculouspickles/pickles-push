@@ -190,3 +190,33 @@ func TestPushDoesNotPutTheDeviceTokenInItsError(t *testing.T) {
 		t.Fatalf("the transport's own reason was lost: %q", err)
 	}
 }
+
+// ES256 means P-256. Accepting another curve did not fail at ParseKey, where it could be
+// read next to the configuration that caused it — it failed in `sign`, on every push,
+// because a 48-byte P-384 component does not fit the 32 bytes a JWS signature gives it
+// (pickles-email#476 item 1).
+func TestParseKeyRefusesACurveThatIsNotP256(t *testing.T) {
+	for _, curve := range []elliptic.Curve{elliptic.P384(), elliptic.P521()} {
+		private, err := ecdsa.GenerateKey(curve, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+		key, err := ParseKey(encoded, "ABCDE12345", "SA2SS4242K")
+		if err == nil {
+			t.Fatalf("%s was accepted, and would have panicked on the first push", curve.Params().Name)
+		}
+		if key != nil {
+			t.Fatal("a refused key came back anyway")
+		}
+		// The message has to name the curve, because the operator is looking at a file
+		// they believe is an APNs key and needs to be told it is not.
+		if !strings.Contains(err.Error(), curve.Params().Name) {
+			t.Fatalf("the error does not say what was wrong: %v", err)
+		}
+	}
+}
