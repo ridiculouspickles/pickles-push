@@ -20,6 +20,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -143,6 +144,24 @@ func copyRightAligned(dst []byte, value *big.Int) {
 	copy(dst[len(dst)-len(b):], b)
 }
 
+// withoutTheURL returns a transport failure with the request URL removed.
+//
+// net/http wraps everything a RoundTripper returns in a *url.Error, which stringifies as
+//
+//	Post "https://api.push.apple.com/3/device/<DEVICE TOKEN>": dial tcp: …
+//
+// and the relay logs that string. So every DNS blip and every dropped connection wrote a
+// device token into relay.log — the one thing registrations.json is 0600 to keep off the
+// rest of the box (pickles-email#475). The wrapped error underneath says everything
+// operationally useful ("dial tcp: i/o timeout") and names nothing.
+func withoutTheURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
+}
+
 // Notification is one push, already addressed.
 type Notification struct {
 	DeviceToken string
@@ -193,7 +212,7 @@ func (c *Client) Push(ctx context.Context, n Notification) error {
 
 	response, err := c.HTTP.Do(request)
 	if err != nil {
-		return fmt.Errorf("apns: %w", err)
+		return fmt.Errorf("apns: %w", withoutTheURL(err))
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))

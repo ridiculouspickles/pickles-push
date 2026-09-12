@@ -352,3 +352,29 @@ func TestJMAPPushForAnUnknownTokenIsNotFound(t *testing.T) {
 		t.Fatalf("want 404 for an unknown delivery token, got %d", recorder.Code)
 	}
 }
+
+// `mode` is a client string, and Put's refusal quotes it: `unknown mode %q`. The relay
+// logged that error under a comment promising it never logged a value, so a registration
+// carrying 8 KiB of junk in `mode` put 8 KiB of junk in relay.log (pickles-email#475).
+func TestAnUnknownModeIsRefusedWithoutLoggingIt(t *testing.T) {
+	r, _ := newRelay(t)
+	var log strings.Builder
+	r.Log = slog.New(slog.NewTextHandler(&log, nil))
+
+	shout := strings.Repeat("shout", 400)
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(
+		`{"deviceToken":"abcdef0123456789abcdef0123456789","topic":"net.pickles.mail.dev","mode":"`+
+			shout+`"}`))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", recorder.Code)
+	}
+	if strings.Contains(log.String(), "shout") {
+		t.Fatalf("the mode the client sent reached the log: %q", log.String())
+	}
+	if r.Store.Count() != 0 {
+		t.Fatal("a registration with no usable mode was stored anyway")
+	}
+}

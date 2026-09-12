@@ -123,6 +123,13 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	if body.Mode == "" {
 		mode = store.Alert
 	}
+	if !mode.Valid() {
+		// Checked here so the refusal never travels through Put, whose error quotes the
+		// value: `unknown mode %q` put up to 8 KiB of client-supplied string into the
+		// log, under a comment promising it would not (pickles-email#475).
+		http.Error(w, "mode must be alert or background", http.StatusBadRequest)
+		return
+	}
 	token := body.Token
 	if token == "" {
 		var err error
@@ -154,9 +161,11 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		ExpiresAt:    admission.ExpiresAt,
 	}
 	if err := r.Store.Put(registration); err != nil {
-		// Never the value: an error from Put can quote what it was given.
-		r.Log.Error("registration rejected", "error", err.Error())
-		http.Error(w, "bad request", http.StatusBadRequest)
+		// A fixed reason, never Put's error: it can quote what it was given, and what it
+		// was given came from a client. Everything Put validates is validated above, so
+		// what is left here is the file — ours, not the caller's, hence a 500.
+		r.Log.Error("registration not stored", "reason", "the store would not write")
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, registerResponse{

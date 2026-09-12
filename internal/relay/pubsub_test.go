@@ -182,3 +182,30 @@ func TestGmailEndpointIsClosedWithoutAServiceAccount(t *testing.T) {
 		t.Fatal("a push was sent with no service account configured")
 	}
 }
+
+// `alg` and `kid` are read before the signature can be checked — `kid` is what chooses
+// the key — so an unauthenticated caller writes them, and the refusal is logged. One
+// line per refusal, not one line of whatever length the caller picked
+// (pickles-email#475).
+func TestARefusalQuotesAtMostSixtyFourBytesOfWhatTheCallerSent(t *testing.T) {
+	r, _ := gmailRelay(t)
+	encode := func(value any) string {
+		raw, _ := json.Marshal(value)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	for _, header := range []map[string]string{
+		{"alg": strings.Repeat("A", 4000), "kid": testKid},
+		{"alg": "RS256", "kid": strings.Repeat("K", 4000)},
+	} {
+		token := encode(header) + "." + encode(claimsFor(testServiceAccount)) + ".signature"
+		request := httptest.NewRequest(http.MethodPost, "/v1/gmail", strings.NewReader("{}"))
+		request.Header.Set("authorization", "Bearer "+token)
+		err := r.verifyPubSub(request)
+		if err == nil {
+			t.Fatalf("expected a refusal for %v", header)
+		}
+		if len(err.Error()) > 128 {
+			t.Fatalf("a refusal ran to %d bytes: %q", len(err.Error()), err)
+		}
+	}
+}
