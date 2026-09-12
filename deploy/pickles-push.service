@@ -21,28 +21,51 @@ Environment=PICKLES_PUSH_PUBLIC_URL=https://push-a.example.com
 Environment=PICKLES_PUSH_APNS_KEY=/etc/pickles-push/apns.p8
 Environment=PICKLES_PUSH_APNS_KEY_ID=CHANGEME
 Environment=PICKLES_PUSH_APNS_TEAM_ID=CHANGEME
-# Unset to disable the Gmail endpoint entirely.
+# Unset to disable the Gmail endpoint entirely. Both are needed: without the service
+# account a token minted for this audience by anybody's Google Cloud project passes.
 #Environment=PICKLES_PUSH_GMAIL_AUDIENCE=https://push-a.example.com/v1/gmail
-# Who may register. Running your own: set a secret and type it into Pickles beside
-# the relay's URL. Our sites set the product ids instead. Neither means anyone.
-#Environment=PICKLES_PUSH_REGISTRATION_SECRET=CHANGEME
-#Environment=PICKLES_PUSH_SUBSCRIPTION_PRODUCTS=com.evilforbeginners.Pickles.push.yearly
+#Environment=PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT=pickles-push@example.iam.gserviceaccount.com
+
+# **Nothing secret on an Environment= line.** A unit file is 0644 by convention and
+# `systemctl show pickles-push` prints its environment to any user on the box, so a
+# registration secret written here is readable by everyone and quotable into a support
+# paste. It goes in a file the service user can read and nobody else can
+# (pickles-email#476 item 6):
+#
+#   install -o root -g pickles-push -m 0640 /dev/null /etc/pickles-push/relay.env
+#
+# Who may register. Running your own: set a secret in that file and type it into
+# Pickles beside the relay's URL. Our sites set the product ids instead. Neither
+# means anyone may register, which the binary warns about at start.
+#
+#   PICKLES_PUSH_REGISTRATION_SECRET=…
+#   PICKLES_PUSH_SUBSCRIPTION_PRODUCTS=com.evilforbeginners.Pickles.push.yearly
+#
+EnvironmentFile=-/etc/pickles-push/relay.env
 
 # It forwards bytes. It has no business doing anything else.
 StateDirectory=pickles-push
 StateDirectoryMode=0700
+UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProtectKernelLogs=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=

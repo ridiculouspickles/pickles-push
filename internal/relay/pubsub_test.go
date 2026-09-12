@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,5 +208,72 @@ func TestARefusalQuotesAtMostSixtyFourBytesOfWhatTheCallerSent(t *testing.T) {
 		if len(err.Error()) > 128 {
 			t.Fatalf("a refusal ran to %d bytes: %q", len(err.Error()), err)
 		}
+	}
+}
+
+// A refresh that fails must not cost us a key we already have.
+//
+// The old cache dropped the cached key on any error and left its clock untouched, so one
+// Google or DNS blip turned every Gmail push into a 403 with a ten-second timeout in
+// front of it, for as long as the blip lasted — and there was no backoff, so each push
+// paid for its own attempt. The key that verified a minute ago verifies now; Google's
+// keys are good for days (pickles-email#476 item 2).
+func TestAFailedRefreshKeepsTheKeyItAlreadyHas(t *testing.T) {
+	signing, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serving atomic.Bool
+	serving.Store(true)
+	document := map[string]any{"keys": []map[string]string{{
+		"kty": "RSA",
+		"kid": "kid-one",
+		"n":   base64.RawURLEncoding.EncodeToString(signing.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString([]byte{0x01, 0x00, 0x01}),
+	}}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !serving.Load() {
+			http.Error(w, "Google is having a moment", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(document)
+	}))
+	defer server.Close()
+
+	cache := newJWKS()
+	cache.url = server.URL
+	first, err := cache.key("kid-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.N.Cmp(signing.N) != 0 {
+		t.Fatal("the key that came back is not the one served")
+	}
+
+	// Old enough to want refreshing, and long enough ago that the retry window is open.
+	serving.Store(false)
+	aWhileAgo := time.Now().Add(-2 * time.Hour)
+	cache.mu.Lock()
+	cache.fetched, cache.attempted = aWhileAgo, aWhileAgo
+	cache.mu.Unlock()
+
+	again, err := cache.key("kid-one")
+	if err != nil {
+		t.Fatalf("a failed refresh threw away a key that still verifies: %v", err)
+	}
+	if again.N.Cmp(signing.N) != 0 {
+		t.Fatal("the cached key came back changed")
+	}
+	// And the failure is remembered, so the next push does not pay for its own attempt.
+	cache.mu.RLock()
+	attempted := cache.attempted
+	cache.mu.RUnlock()
+	if !attempted.After(aWhileAgo) {
+		t.Fatal("a failed fetch was not recorded, so every push retries it")
+	}
+	// A kid we have never seen is still a refusal. Falling back is about keeping a key,
+	// not about inventing one.
+	if _, err := cache.key("kid-two"); err == nil {
+		t.Fatal("an unknown kid was admitted")
 	}
 }

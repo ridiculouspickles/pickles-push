@@ -17,6 +17,7 @@
 package entitlement
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -45,6 +46,11 @@ type Admission struct {
 	// expire. The relay stops delivering after it; a re-registration with a renewed
 	// transaction moves it.
 	ExpiresAt time.Time
+	// Signed is when Apple signed the transaction, or zero when the proof was not one.
+	// Nothing is decided on it yet — it is reported so the log can say how old the
+	// transactions real devices present actually are, which is what AppleVerifier's
+	// MaxSignedAge needs before it can be turned on.
+	Signed time.Time
 }
 
 // Admit checks a registration.
@@ -58,7 +64,7 @@ func (p Policy) Admit(authorization, transaction, bundleID string, sandbox bool,
 	}
 	if p.Secret != "" {
 		if presented, ok := strings.CutPrefix(authorization, "Bearer "); ok {
-			if subtle.ConstantTimeCompare([]byte(presented), []byte(p.Secret)) == 1 {
+			if sameSecret(presented, p.Secret) {
 				return Admission{}, nil
 			}
 			// A wrong secret is refused outright even if a transaction was also sent:
@@ -72,7 +78,7 @@ func (p Policy) Admit(authorization, transaction, bundleID string, sandbox bool,
 		if err != nil {
 			return Admission{}, fmt.Errorf("%w: %v", ErrRefused, err)
 		}
-		return Admission{ExpiresAt: tx.Expires.Add(p.Apple.Grace)}, nil
+		return Admission{ExpiresAt: tx.Expires.Add(p.Apple.Grace), Signed: tx.Signed}, nil
 	}
 	switch {
 	case p.Apple != nil && p.Secret != "":
@@ -82,4 +88,16 @@ func (p Policy) Admit(authorization, transaction, bundleID string, sandbox bool,
 	default:
 		return Admission{}, fmt.Errorf("%w: this relay's secret is required", ErrRefused)
 	}
+}
+
+// sameSecret compares two secrets without answering faster for the wrong length.
+//
+// subtle.ConstantTimeCompare returns 0 immediately when the lengths differ, so it is
+// constant-time only across equal-length inputs — and the presented value's length is
+// the caller's to choose. Hashing both sides first makes every comparison 32 bytes
+// against 32 bytes.
+func sameSecret(presented, expected string) bool {
+	a := sha256.Sum256([]byte(presented))
+	b := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }

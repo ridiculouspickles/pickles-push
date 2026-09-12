@@ -122,7 +122,7 @@ POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, 
 DELETE /v1/register/{token}  → 204, whether or not it existed
 POST   /v1/push/{token}      the JMAP PushSubscription URL; body forwarded unread
 POST   /v1/gmail             Cloud Pub/Sub push, OIDC-verified
-GET    /healthz              → {ok, registrations}
+GET    /healthz              → {ok}
 ```
 
 `POST /v1/register` has no account behind it: what it checks is a proof — the secret or

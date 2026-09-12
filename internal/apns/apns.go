@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -18,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -62,6 +62,15 @@ func ParseKey(pemBytes []byte, keyID, teamID string) (*Key, error) {
 	private, ok := parsed.(*ecdsa.PrivateKey)
 	if !ok {
 		return nil, fmt.Errorf("apns: expected an ECDSA key, got %T", parsed)
+	}
+	// ES256 means P-256 and nothing else. Accepting another curve here did not fail
+	// here: a P-384 signature has 48-byte components, and writing one into the 32-byte
+	// half of a JWS signature panicked *at push time*, on every push, in a goroutine
+	// far from the configuration that caused it (pickles-email#476).
+	if private.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("apns: the key must be on P-256, this one is on %s — "+
+			"Apple issues P-256 .p8 keys, so this is probably not an APNs key",
+			private.Curve.Params().Name)
 	}
 	return &Key{PrivateKey: private, KeyID: keyID, TeamID: teamID}, nil
 }
@@ -133,15 +142,14 @@ func sign(key *Key, now time.Time) (string, error) {
 	}
 	// JWS wants fixed-width r and s, not the ASN.1 sequence ecdsa.Sign would give from
 	// SignASN1. A short r must be left-padded or Apple rejects the token as malformed.
+	// FillBytes does the left-padding JWS wants, and on a value too big for the
+	// destination it panics saying so rather than with a slice-bounds error from an
+	// index calculation. ParseKey now refuses anything but P-256, so neither can
+	// happen; this is the belt to that pair of braces.
 	signature := make([]byte, 64)
-	copyRightAligned(signature[:32], r)
-	copyRightAligned(signature[32:], s)
+	r.FillBytes(signature[:32])
+	s.FillBytes(signature[32:])
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
-}
-
-func copyRightAligned(dst []byte, value *big.Int) {
-	b := value.Bytes()
-	copy(dst[len(dst)-len(b):], b)
 }
 
 // withoutTheURL returns a transport failure with the request URL removed.

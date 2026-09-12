@@ -36,11 +36,17 @@ const googleCertsURL = "https://www.googleapis.com/oauth2/v3/certs"
 var googleIssuers = []string{"accounts.google.com", "https://accounts.google.com"}
 
 type jwks struct {
-	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
+	mu   sync.RWMutex
+	keys map[string]*rsa.PublicKey
+	// fetched is the last *successful* fetch, and is what staleness is measured from.
 	fetched time.Time
-	client  *http.Client
-	url     string
+	// attempted is the last fetch begun, successful or not. Separating the two is the
+	// whole of pickles-email#476 item 2: a failed refresh used to leave `fetched`
+	// where it was, so every subsequent push retried the fetch, and a Google or DNS
+	// blip meant a ten-second stall and a 403 for each of them.
+	attempted time.Time
+	client    *http.Client
+	url       string
 }
 
 func newJWKS() *jwks {
@@ -51,26 +57,77 @@ func newJWKS() *jwks {
 	}
 }
 
-// key returns the signing key for a kid, refreshing at most every ten minutes.
+const (
+	// How long a successful fetch is trusted without asking again.
+	jwksLifetime = time.Hour
+	// How often we are willing to ask. One attempt per window across all goroutines,
+	// which is both the backoff after a failure and the cap on a rotation stampede.
+	jwksRetry = 10 * time.Minute
+)
+
+// key returns the signing key for a kid.
 //
 // Google rotates these, and an unknown kid is the normal way a rotation announces
-// itself — so an unknown kid forces one refresh rather than a rejection.
+// itself — so an unknown kid may force a refresh rather than a rejection.
+//
+// Two rules, and the second is why this function is longer than it looks:
+//
+//   - **A refresh failure never costs us a key we already have.** The old code dropped
+//     the cached key on any error and left the retry clock untouched, so one DNS blip
+//     turned every Gmail push into a 403 with a ten-second stall in front of it, for as
+//     long as the blip lasted. A key that verified a minute ago verifies now; Google's
+//     keys are valid for days.
+//   - **The fetch happens outside the lock.** It used to run under the write lock, so
+//     the one slow request held up every other push behind it. What is claimed under
+//     the lock is the *right to attempt*, which is what keeps a stampede to one fetch.
 func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 	j.mu.RLock()
-	found, ok := j.keys[kid]
-	stale := time.Since(j.fetched) > time.Hour
+	cached, known := j.keys[kid]
+	fresh := time.Since(j.fetched) <= jwksLifetime
 	j.mu.RUnlock()
-	if ok && !stale {
-		return found, nil
+	if known && fresh {
+		return cached, nil
 	}
+
 	j.mu.Lock()
-	defer j.mu.Unlock()
-	if time.Since(j.fetched) < 10*time.Minute {
-		if found, ok := j.keys[kid]; ok {
-			return found, nil
+	// Re-read under the lock: another goroutine may have refreshed while we waited.
+	cached, known = j.keys[kid]
+	if known && time.Since(j.fetched) <= jwksLifetime {
+		j.mu.Unlock()
+		return cached, nil
+	}
+	if time.Since(j.attempted) < jwksRetry {
+		// Somebody asked recently. Whatever we have is what we have.
+		j.mu.Unlock()
+		if known {
+			return cached, nil
 		}
 		return nil, fmt.Errorf("unknown signing key %q", clip(kid))
 	}
+	j.attempted = time.Now()
+	j.mu.Unlock()
+
+	loaded, err := j.load()
+	if err != nil {
+		if known {
+			// The cached key is still a real Google key. Refusing pushes because we
+			// could not confirm that is the failure this returns instead of.
+			return cached, nil
+		}
+		return nil, err
+	}
+	j.mu.Lock()
+	j.keys, j.fetched = loaded, time.Now()
+	found, ok := j.keys[kid]
+	j.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown signing key %q", clip(kid))
+	}
+	return found, nil
+}
+
+// load fetches and parses the JWKS. It holds no lock.
+func (j *jwks) load() (map[string]*rsa.PublicKey, error) {
 	response, err := j.client.Get(j.url)
 	if err != nil {
 		return nil, err
@@ -87,7 +144,7 @@ func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&document); err != nil {
 		return nil, err
 	}
-	fresh := map[string]*rsa.PublicKey{}
+	loaded := map[string]*rsa.PublicKey{}
 	for _, k := range document.Keys {
 		if k.Kty != "RSA" {
 			continue
@@ -100,19 +157,15 @@ func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 		if err != nil {
 			continue
 		}
-		fresh[k.Kid] = &rsa.PublicKey{
+		loaded[k.Kid] = &rsa.PublicKey{
 			N: new(big.Int).SetBytes(modulus),
 			E: int(bigEndianUint(exponent)),
 		}
 	}
-	if len(fresh) == 0 {
+	if len(loaded) == 0 {
 		return nil, errors.New("no usable keys in the JWKS")
 	}
-	j.keys, j.fetched = fresh, time.Now()
-	if found, ok := j.keys[kid]; ok {
-		return found, nil
-	}
-	return nil, fmt.Errorf("unknown signing key %q", clip(kid))
+	return loaded, nil
 }
 
 // claimIsTrue reads a boolean claim that some issuers write as the string "true".
