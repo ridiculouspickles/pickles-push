@@ -58,6 +58,13 @@ func main() {
 	}
 }
 
+// How long a registration outlives the last time its device said hello.
+//
+// Seven daily renewals. Long enough for a phone in a drawer over a holiday, short enough
+// that the address in a Gmail registration does not outlive the device by a month
+// (pickles-email#520).
+const registrationLifetime = 7 * 24 * time.Hour
+
 func run(log *slog.Logger) error {
 	listen := envOr("PICKLES_PUSH_LISTEN", ":8080")
 	publicURL := os.Getenv("PICKLES_PUSH_PUBLIC_URL")
@@ -156,9 +163,14 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Devices re-register daily, so anything unseen for a month is a device that was
-	// wiped, reinstalled, or had push turned off — none of which Apple tells us about
-	// reliably.
+	// Devices re-register daily and on every foreground, so a row unseen for a week has
+	// missed seven of those: a device that was wiped, reinstalled, or had push turned
+	// off, none of which Apple reports reliably. A phone that is merely offline costs
+	// nothing here — its push expires at Apple within the hour and its row is refreshed
+	// the moment it comes back.
+	//
+	// It was a month, which is a long time to keep a device token and — on the Gmail
+	// path — an email address, for a device that is not there (pickles-email#520).
 	go func() {
 		ticker := time.NewTicker(6 * time.Hour)
 		defer ticker.Stop()
@@ -167,7 +179,8 @@ func run(log *slog.Logger) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				removed, err := registrations.Prune(time.Now().Add(-30 * 24 * time.Hour))
+				now := time.Now()
+				removed, err := registrations.Prune(now.Add(-registrationLifetime), now)
 				if err != nil {
 					log.Error("prune failed", "error", err.Error())
 				} else if removed > 0 {

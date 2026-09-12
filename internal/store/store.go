@@ -224,16 +224,34 @@ func (s *Store) Delete(token string) error {
 	return s.flushLocked()
 }
 
-// Prune drops registrations not seen since the cutoff.
+// Prune drops registrations that are no longer any use to the device that made them.
 //
-// A device that has stopped re-registering has been deleted, wiped, or had push turned
-// off, and Apple will not tell us about most of those. Returns how many went.
-func (s *Store) Prune(before time.Time) (int, error) {
+// Two reasons a row goes, and they are different questions:
+//
+//   - **Not seen since seenBefore.** A device that has stopped re-registering has been
+//     deleted, wiped, or had push turned off, and Apple will not tell us about most of
+//     those. Registration is refreshed daily and on every foreground, so a row that has
+//     missed a week of those belongs to a device that is gone rather than merely asleep
+//     — a phone that is only offline costs nothing here, because Apple expires its push
+//     after an hour and the row is refreshed the moment it comes back.
+//
+//   - **Proof expired before expiredBefore.** `ExpiresAt` is a subscription's expiry
+//     plus the grace, after which nothing is delivered to this row at all. Keeping it
+//     then is storage with no purpose. Zero means the proof does not expire — a
+//     self-hoster's secret, or an open relay — and never prunes on this rule.
+//
+// The second matters because a row holds a device token, a delivery token and, on the
+// Gmail path, an email address: the one personal thing this relay keeps, for a device
+// that may no longer exist.
+//
+// Returns how many went.
+func (s *Store) Prune(seenBefore, expiredBefore time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := 0
 	for token, r := range s.registrations {
-		if r.SeenAt.Before(before) {
+		expired := !r.ExpiresAt.IsZero() && r.ExpiresAt.Before(expiredBefore)
+		if r.SeenAt.Before(seenBefore) || expired {
 			delete(s.registrations, token)
 			removed++
 		}
