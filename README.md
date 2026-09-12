@@ -133,6 +133,27 @@ Sending `token` back on re-registration keeps the same delivery token, which is 
 a device keep one provider-side subscription for its lifetime instead of recreating it
 every time the app comes to the foreground.
 
+### What a registration keeps, and for how long
+
+A row holds the APNs device token, the delivery token, the bundle id, the mode, and — on
+the Gmail path only — **the mailbox address**, because Pub/Sub identifies a mailbox by
+address and there is no other way to route it. That address is the one personal thing
+this relay stores.
+
+A row goes when either is true:
+
+- **Not seen for seven days.** Devices re-register daily and on every foreground, so
+  seven days is seven missed hellos: a device wiped, reinstalled, or with push turned
+  off, none of which Apple reports reliably. A phone that is merely *offline* costs
+  nothing — its push expires at Apple within the hour, and its row is refreshed the
+  moment it comes back.
+- **Its proof has expired.** Nothing is delivered to a row past `ExpiresAt` anyway, so
+  keeping it is storage with no purpose. A registration whose proof does not expire — a
+  self-hoster's secret, or an open relay — is never dropped by this rule.
+
+The store is a cache the device rebuilds by re-registering, so pruning early costs a
+returning device one round trip and nothing else.
+
 ## Tests
 
 ```sh

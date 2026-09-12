@@ -146,12 +146,13 @@ func TestDeleteIsIdempotent(t *testing.T) {
 
 func TestPruneDropsOnlyTheStale(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	now := time.Now()
 	stale := newRegistration("tok-stale")
-	stale.SeenAt = time.Now().Add(-40 * 24 * time.Hour)
+	stale.SeenAt = now.Add(-8 * 24 * time.Hour)
 	_ = s.Put(stale)
 	_ = s.Put(newRegistration("tok-fresh"))
 
-	removed, err := s.Prune(time.Now().Add(-30 * 24 * time.Hour))
+	removed, err := s.Prune(now.Add(-7*24*time.Hour), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +161,63 @@ func TestPruneDropsOnlyTheStale(t *testing.T) {
 	}
 	if _, err := s.Get("tok-fresh"); err != nil {
 		t.Fatal("pruning took a live registration with it")
+	}
+}
+
+// A row whose proof has run out is never delivered to again, so keeping it is storage
+// with no purpose — and on the Gmail path that storage is an email address
+// (pickles-email#520).
+func TestPruneDropsAnExpiredProofEvenIfSeenToday(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	now := time.Now()
+	lapsed := newRegistration("tok-lapsed")
+	lapsed.SeenAt = now
+	lapsed.ExpiresAt = now.Add(-time.Minute)
+	_ = s.Put(lapsed)
+
+	removed, err := s.Prune(now.Add(-7*24*time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected the lapsed registration to go, got %d removals", removed)
+	}
+}
+
+// Zero means the proof does not expire — a self-hoster's secret, or an open relay — and
+// must never be read as "expired at the zero time".
+func TestPruneKeepsARegistrationWhoseProofDoesNotExpire(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	now := time.Now()
+	forever := newRegistration("tok-secret")
+	forever.SeenAt = now
+	forever.ExpiresAt = time.Time{}
+	_ = s.Put(forever)
+
+	removed, err := s.Prune(now.Add(-7*24*time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Fatalf("pruned a registration whose proof never expires")
+	}
+	if _, err := s.Get("tok-secret"); err != nil {
+		t.Fatal("the registration is gone")
+	}
+}
+
+// A proof that is still good keeps the row, which is the ordinary case for a subscriber.
+func TestPruneKeepsALiveProof(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	now := time.Now()
+	live := newRegistration("tok-live")
+	live.SeenAt = now
+	live.ExpiresAt = now.Add(24 * time.Hour)
+	_ = s.Put(live)
+
+	removed, _ := s.Prune(now.Add(-7*24*time.Hour), now)
+	if removed != 0 {
+		t.Fatalf("pruned a registration whose proof is still good")
 	}
 }
 
