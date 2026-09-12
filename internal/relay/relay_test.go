@@ -52,6 +52,17 @@ func newRelay(t *testing.T) (*Relay, *recordingPusher) {
 	}, pusher
 }
 
+// settle waits for the delivery workers to finish whatever the request just queued.
+//
+// Pushes deliberately do not run on the request goroutine (pickles-email#464), so a
+// test that asserts on one has to wait for it. Waiting is the right shape: a relay that
+// delivered inline for tests and asynchronously in production would be two code paths
+// with only one of them exercised.
+func settle(t *testing.T, r *Relay) {
+	t.Helper()
+	r.WaitForDeliveries()
+}
+
 func register(t *testing.T, r *Relay, body string) registerResponse {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(body))
@@ -124,6 +135,7 @@ func TestPushForwardsThePayloadWithoutReadingIt(t *testing.T) {
 		t.Fatalf("expected 200, got %d", recorder.Code)
 	}
 
+	settle(t, r)
 	sent := pusher.all()
 	if len(sent) != 1 {
 		t.Fatalf("expected one push, got %d", len(sent))
@@ -162,6 +174,7 @@ func TestBackgroundModeSendsASilentPush(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
 	r.Routes().ServeHTTP(httptest.NewRecorder(), request)
 
+	settle(t, r)
 	sent := pusher.all()
 	if len(sent) != 1 || !sent[0].Background {
 		t.Fatalf("expected one background push, got %+v", sent)
@@ -188,6 +201,7 @@ func TestPushToAnUnknownTokenIs404AndSendsNothing(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", recorder.Code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("an unknown token must not cause a push")
 	}
@@ -203,6 +217,7 @@ func TestOversizedPayloadIsRefused(t *testing.T) {
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", recorder.Code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("nothing oversized should reach Apple, which would reject it anyway")
 	}
@@ -216,6 +231,7 @@ func TestAppleSayingGoneDropsTheRegistration(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
 	r.Routes().ServeHTTP(httptest.NewRecorder(), request)
 
+	settle(t, r)
 	if _, err := r.Store.Get(response.Token); err == nil {
 		// Apple only tells us once. Keeping the row means pushing into the void for a
 		// month until Prune notices.
@@ -262,6 +278,7 @@ func TestGmailEndpointRefusesAnUnsignedRequest(t *testing.T) {
 		// wake somebody's phone all night.
 		t.Fatalf("expected 403 with no bearer token, got %d", recorder.Code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("an unverified Pub/Sub request caused a push")
 	}
@@ -341,6 +358,7 @@ func TestALapsedRegistrationGetsNothing(t *testing.T) {
 		// retry, and the subscription should survive a renewal.
 		t.Fatalf("push returned %d", recorder.Code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("nothing should reach Apple for a lapsed registration")
 	}
@@ -420,4 +438,162 @@ func TestARegistrationMayBeLargerThanAStateChange(t *testing.T) {
 	if strings.Contains(log.String(), "jjjj") {
 		t.Fatal("the body reached the log")
 	}
+}
+
+// A delivery token is a bearer capability: holding one means being able to wake a
+// device. It must not mean being able to wake it all night (pickles-email#464).
+//
+// The provider is still answered 200 throughout. A 429 to a JMAP server is a retry, and
+// a retry is a second notification to suppress on a device that has had the first — so
+// the flood is dropped quietly and the device syncs when it is next opened, which it
+// would have done anyway.
+func TestPushesToOneRegistrationAreRateLimited(t *testing.T) {
+	r, pusher := newRelay(t)
+	var log strings.Builder
+	r.Log = slog.New(slog.NewTextHandler(&log, nil))
+	response := register(t, r, goodRegistration)
+
+	for i := range pushBurst + 10 {
+		request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token,
+			strings.NewReader("ciphertext"))
+		recorder := httptest.NewRecorder()
+		r.Routes().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("push %d returned %d; a provider that reads an error retries it", i, recorder.Code)
+		}
+	}
+	settle(t, r)
+	if sent := len(pusher.all()); sent != pushBurst {
+		t.Fatalf("%d pushes reached Apple, expected the burst of %d", sent, pushBurst)
+	}
+	if !strings.Contains(log.String(), "rate limiting pushes") {
+		t.Fatalf("nothing in the log says why pushes stopped: %q", log.String())
+	}
+	if strings.Count(log.String(), "rate limiting pushes") != 1 {
+		// The refusals arrive at whatever rate the sender chose. A line each hands them
+		// the log as well.
+		t.Fatalf("one line per spell, not per push: %q", log.String())
+	}
+}
+
+// A push used to run on the request's context. A JMAP server whose own timeout is
+// shorter than the APNs client's twenty seconds therefore cancelled the push it had just
+// asked for — and then retried, which is the duplicate notification the design is
+// arranged to avoid (pickles-email#464).
+func TestAProviderHangingUpDoesNotCancelThePush(t *testing.T) {
+	r, _ := newRelay(t)
+	live := &contextAwarePusher{}
+	r.Pusher = live
+	response := register(t, r, goodRegistration)
+
+	// The provider's request context, already over by the time anything is delivered.
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token,
+		strings.NewReader("ciphertext")).WithContext(dead)
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("push returned %d", recorder.Code)
+	}
+	settle(t, r)
+	if live.count() != 1 {
+		t.Fatalf("%d pushes were attempted", live.count())
+	}
+	if live.cancelled() {
+		t.Fatal("the push carried the provider's cancelled context to Apple")
+	}
+	if !live.bounded() {
+		// Not the request's deadline, but a deadline: a worker that could wait forever
+		// is a worker pool that empties and never refills.
+		t.Fatal("the push had no deadline of its own")
+	}
+}
+
+// One valid proof must not be able to grow the file without bound: it is rewritten
+// whole, fsynced and renamed on every write, so its size is the cost of every write
+// (pickles-email#464).
+func TestASiteAtItsLimitSaysSoWithoutBlamingTheDevice(t *testing.T) {
+	r, _ := newRelay(t)
+	var log strings.Builder
+	r.Log = slog.New(slog.NewTextHandler(&log, nil))
+	r.Store.MaxRegistrations = 1
+	register(t, r, goodRegistration)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(
+		`{"deviceToken":"9999999999999999999999999999999a","topic":"net.pickles.mail.dev"}`))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	// 503, not 403: it is a statement about this site rather than about this device,
+	// and it may be true of neither tomorrow.
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(log.String(), "registration limit") {
+		t.Fatalf("the log does not say the site is full: %q", log.String())
+	}
+}
+
+// The Gmail address is accepted on trust — Pub/Sub names the mailbox and nothing here
+// proves the registering device reads it. The cap is what bounds both the surveillance
+// and the fan-out.
+func TestTooManyDevicesForOneAddressIsRefused(t *testing.T) {
+	r, _ := newRelay(t)
+	r.Store.MaxPerAddress = 1
+	register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","gmailAddress":"someone@gmail.com"}`)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(
+		`{"deviceToken":"9999999999999999999999999999999a",`+
+			`"topic":"net.pickles.mail.dev","gmailAddress":"someone@gmail.com"}`))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if body := recorder.Body.String(); strings.Contains(body, "gmail.com") {
+		// The answer says what is wrong without repeating the address back, which is
+		// the one personal thing on this path.
+		t.Fatalf("the refusal quoted the address: %q", body)
+	}
+}
+
+// contextAwarePusher records the state of the context it was handed, which is the only
+// way to tell whose context a push is running on.
+type contextAwarePusher struct {
+	mu       sync.Mutex
+	pushes   int
+	wasDone  bool
+	deadline bool
+}
+
+func (p *contextAwarePusher) Push(ctx context.Context, _ apns.Notification) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushes++
+	if ctx.Err() != nil {
+		p.wasDone = true
+	}
+	if _, ok := ctx.Deadline(); ok {
+		p.deadline = true
+	}
+	return nil
+}
+
+func (p *contextAwarePusher) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pushes
+}
+
+func (p *contextAwarePusher) cancelled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wasDone
+}
+
+func (p *contextAwarePusher) bounded() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deadline
 }

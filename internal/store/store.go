@@ -93,9 +93,39 @@ type Registration struct {
 // malformed one in anything they send back over the network.
 var ErrNotFound = errors.New("registration not found")
 
+// ErrFull means this site will not hold another registration.
+//
+// The file is rewritten whole, fsynced and renamed on every write, so its size is not
+// only storage: it is the cost of every Put, Delete and Prune. A registration with no
+// token mints a new one, and a StoreKit JWS is replayable, so one valid proof could
+// create rows at disk speed until each write was rewriting hundreds of megabytes
+// (pickles-email#464). A device already here is always allowed to re-register; what is
+// capped is growth.
+var ErrFull = errors.New("this site is not accepting more registrations")
+
+// ErrTooManyForAddress means one Gmail address already has as many devices as we will
+// hold for it.
+//
+// The address is accepted on trust — Pub/Sub names the mailbox and there is nothing on
+// this path to prove the registering device reads it — so the cap is also what bounds
+// how far one published message fans out, and how much one unverified claim can cost.
+var ErrTooManyForAddress = errors.New("too many registrations for that address")
+
+// What a site will hold. Both are generous: the phone, the iPad and the Mac of every
+// subscriber we are likely to have, and then some.
+const (
+	DefaultMaxRegistrations = 5000
+	DefaultMaxPerAddress    = 16
+)
+
 // Store is safe for concurrent use.
 type Store struct {
 	path string
+
+	// MaxRegistrations and MaxPerAddress bound the file. Zero means no limit, which is
+	// what a test that does not care sets. Open fills in the defaults.
+	MaxRegistrations int
+	MaxPerAddress    int
 
 	mu sync.RWMutex
 	// by token
@@ -109,7 +139,12 @@ type Store struct {
 // successful start and would quietly stop delivering to every device until each came
 // back to re-register.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, registrations: map[string]Registration{}}
+	s := &Store{
+		path:             path,
+		registrations:    map[string]Registration{},
+		MaxRegistrations: DefaultMaxRegistrations,
+		MaxPerAddress:    DefaultMaxPerAddress,
+	}
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -151,13 +186,46 @@ func (s *Store) Put(r Registration) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.registrations[r.Token]; ok {
+	existing, replacing := s.registrations[r.Token]
+	if replacing {
 		r.CreatedAt = existing.CreatedAt
 	}
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = r.SeenAt
 	}
-	r.GmailAddress = strings.ToLower(r.GmailAddress)
+	r.GmailAddress = strings.ToLower(strings.TrimSpace(r.GmailAddress))
+
+	// Counted before anything is written, and counted net: the rows this Put is about
+	// to supersede are leaving, so a device coming back with a new delivery token is
+	// not growth and must not be refused by a full site.
+	superseded := 0
+	for token, other := range s.registrations {
+		if token != r.Token && other.DeviceToken == r.DeviceToken && other.Topic == r.Topic {
+			superseded++
+		}
+	}
+	after := len(s.registrations) + 1 - superseded
+	if replacing {
+		after--
+	}
+	if s.MaxRegistrations > 0 && after > s.MaxRegistrations {
+		return ErrFull
+	}
+	if r.GmailAddress != "" && s.MaxPerAddress > 0 {
+		forAddress := 1
+		for token, other := range s.registrations {
+			switch {
+			case token == r.Token:
+			case other.DeviceToken == r.DeviceToken && other.Topic == r.Topic:
+			case other.GmailAddress == r.GmailAddress:
+				forAddress++
+			}
+		}
+		if forAddress > s.MaxPerAddress {
+			return ErrTooManyForAddress
+		}
+	}
+
 	s.registrations[r.Token] = r
 
 	// **One registration per device per app, on this site.** A device that registers

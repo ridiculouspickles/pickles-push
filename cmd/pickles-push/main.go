@@ -242,6 +242,11 @@ func run(log *slog.Logger) error {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	// A push is queued off the request goroutine now, so the listener stopping is not
+	// the end of the work: the provider has already been told 200 for whatever is in
+	// the queue. Refuse new work, then finish what was accepted.
+	service.Close()
+	service.WaitForDeliveries()
 	log.Info("stopped")
 	return nil
 }
