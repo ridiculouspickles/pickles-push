@@ -129,6 +129,14 @@ type registerRequest struct {
 	// a relay that sells one. A self-hosted relay is given its secret in the
 	// Authorization header instead, and an open relay needs neither.
 	Transaction string `json:"transaction,omitempty"`
+	// Secret is a secret the *device* minted and keeps beside its delivery token, sent
+	// on every registration. The first one seen for a token takes ownership of the row;
+	// after that only the same secret may rewrite or delete it (pickles-email#463).
+	//
+	// Not the same thing as the relay's own secret, which arrives in the Authorization
+	// header and says who may register at all. This one says which registration is
+	// yours.
+	Secret string `json:"secret,omitempty"`
 }
 
 type registerResponse struct {
@@ -179,6 +187,12 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "deviceToken must be hex", http.StatusBadRequest)
 		return
 	}
+	if body.Secret != "" && !validSecret(body.Secret) {
+		// Refused rather than quietly ignored. A device that sends something too short
+		// to be unguessable would otherwise believe its row was protected.
+		http.Error(w, "secret must be 32 to 128 printable characters", http.StatusBadRequest)
+		return
+	}
 	mode := store.Mode(body.Mode)
 	if body.Mode == "" {
 		mode = store.Alert
@@ -224,6 +238,7 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		Sandbox:      body.Sandbox,
 		Mode:         mode,
 		GmailAddress: body.GmailAddress,
+		SecretHash:   store.HashSecret(body.Secret),
 		SeenAt:       now,
 		ExpiresAt:    admission.ExpiresAt,
 	}
@@ -236,6 +251,12 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		// 503 rather than 403: it is a statement about this site, not about this device,
 		// and it may well be true of neither tomorrow.
 		http.Error(w, "this site is not accepting more registrations", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, store.ErrWrongSecret):
+		// The same answer a token nobody holds would get. Telling a caller that a token
+		// exists but is not theirs confirms the token.
+		r.Log.Warn("registration refused", "reason", "the delivery token belongs to another device")
+		http.Error(w, "malformed token", http.StatusBadRequest)
 		return
 	case errors.Is(err, store.ErrTooManyForAddress):
 		r.Log.Warn("registration refused", "reason", "too many devices for one address")
@@ -254,6 +275,14 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	})
 }
 
+// managementHeader carries the device's own secret on a DELETE, where there is no body
+// to put it in.
+//
+// Its own header rather than Authorization, which on this path already carries the
+// relay's secret on a self-hosted site. The two answer different questions: that one is
+// "may you register here", this one is "is this registration yours".
+const managementHeader = "X-Pickles-Registration-Secret"
+
 func (r *Relay) handleUnregister(w http.ResponseWriter, request *http.Request) {
 	token := request.PathValue("token")
 	if !validToken(token) {
@@ -262,8 +291,14 @@ func (r *Relay) handleUnregister(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if err := r.Store.Delete(token); err != nil {
-		r.Log.Error("delete failed", "error", err.Error())
+	switch err := r.Store.DeleteIfOwned(token, request.Header.Get(managementHeader)); {
+	case err == nil:
+	case errors.Is(err, store.ErrWrongSecret):
+		// 204, the same as a token nobody holds. The row is untouched; saying so would
+		// confirm that the token names something.
+		r.Log.Warn("unregister ignored", "reason", "the delivery token belongs to another device")
+	default:
+		r.Log.Error("delete failed", "reason", "the store would not write")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -530,6 +565,20 @@ func validToken(token string) bool {
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validSecret checks shape only: long enough not to be guessed, short enough not to be
+// a payload, and printable so that it cannot smuggle anything into a header or a log.
+func validSecret(secret string) bool {
+	if len(secret) < 32 || len(secret) > 128 {
+		return false
+	}
+	for _, c := range secret {
+		if c < 0x21 || c > 0x7e {
 			return false
 		}
 	}

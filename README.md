@@ -116,12 +116,15 @@ to a healthy start while silently dropping every device.
 Four endpoints, all JSON.
 
 ```
-POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, token?, transaction?}
+POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, token?,
+                              transaction?, secret?}
                              Authorization: Bearer <secret>   (a self-hosted relay)
                              → {token, pushUrl}; 403 with a reason when refused
                                503 when the site holds as many as it will
                                409 when one Gmail address has as many devices as it will
-DELETE /v1/register/{token}  → 204, whether or not it existed
+DELETE /v1/register/{token}  X-Pickles-Registration-Secret: <secret>
+                             → 204, whether or not it existed — and whether or not it
+                               was yours to delete
 POST   /v1/push/{token}      the JMAP PushSubscription URL; body forwarded unread
 POST   /v1/gmail             Cloud Pub/Sub push, OIDC-verified
 GET    /healthz              → {ok}
@@ -160,6 +163,42 @@ to deliver to and nothing about who is being served.
 Sending `token` back on re-registration keeps the same delivery token, which is what lets
 a device keep one provider-side subscription for its lifetime instead of recreating it
 every time the app comes to the foreground.
+
+### Which registration is yours
+
+`secret` is **minted by the device**, kept beside its delivery token, and sent on every
+registration. The first one seen for a delivery token takes ownership of the row; after
+that only the same secret may rewrite it, and `DELETE` needs it in the
+`X-Pickles-Registration-Secret` header.
+
+It is not the relay's own secret, which travels in `Authorization` and answers a
+different question: that one is *may you register here*, this one is *is this
+registration yours*.
+
+Without it, the delivery token alone was enough to take a registration over — point it
+at another device token and the original stops being woken while the new one starts —
+and `DELETE` needed no proof at all. A token reaches the provider and nobody else, so
+that took a leak first; but a token is documented as a capability to wake *one* device,
+and the code granted more than that.
+
+Three things worth knowing about it:
+
+- **The device mints it, not the relay.** A relay that issued one would have to be
+  trusted to keep it, and the rollout would need a flag day: every device already
+  registered would be handed a secret it did not know to send back, and its next
+  re-registration would be refused — silently, since the symptom is no notifications.
+  Minted at the far end, a build that does not know about this stays exactly as it is.
+- **A row with no secret is still rewritten and deleted without one**, because that is
+  what every build shipped so far expects. The window closes by itself: a row is pruned
+  a week after its device last said hello, so once the only build in use mints secrets
+  there are no unowned rows left.
+- **Refusals are indistinguishable from a token nobody holds** — `400 malformed token`
+  on registration, `204` on delete, in both cases what an unknown token gets. An
+  endpoint that answers "that exists, but it is not yours" is an endpoint that confirms
+  tokens for you.
+
+Only the SHA-256 is stored. There is no operation here that needs the secret back, and a
+file of them would be a file of credentials rather than a routing table.
 
 ### What a registration keeps, and for how long
 

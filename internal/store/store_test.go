@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,5 +387,104 @@ func TestOneAddressHoldsOnlySoManyDevices(t *testing.T) {
 	}
 	if len(s.ByGmail("someone@gmail.com")) != 2 {
 		t.Fatalf("the address ended up with %d devices", len(s.ByGmail("someone@gmail.com")))
+	}
+}
+
+// The delivery token alone used to be enough to take a registration over: Put
+// overwrote the device token, the topic, the mode and the address of whatever row a
+// token named, and Delete removed it with no proof at all (pickles-email#463).
+func TestAnOwnedRegistrationIsOnlyRewrittenByItsOwner(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	const secret = "a-secret-the-device-minted-and-kept"
+	mine := newRegistration("tok-one")
+	mine.SecretHash = HashSecret(secret)
+	if err := s.Put(mine); err != nil {
+		t.Fatal(err)
+	}
+
+	// The attack: the same delivery token, pointed at somebody else's device.
+	hijack := newRegistration("tok-one")
+	hijack.DeviceToken = "9999999999999999999999999999999999999999999999999999999999999999"
+	if err := s.Put(hijack); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("expected ErrWrongSecret with no secret presented, got %v", err)
+	}
+	hijack.SecretHash = HashSecret("a-secret-the-attacker-made-up-inst")
+	if err := s.Put(hijack); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("expected ErrWrongSecret with the wrong secret, got %v", err)
+	}
+	got, _ := s.Get("tok-one")
+	if got.DeviceToken != mine.DeviceToken {
+		t.Fatal("the row was pointed at another device anyway")
+	}
+
+	// The owner still re-registers on every foreground, which is the common case.
+	refresh := newRegistration("tok-one")
+	refresh.SecretHash = HashSecret(secret)
+	refresh.Mode = Background
+	if err := s.Put(refresh); err != nil {
+		t.Fatalf("the owner was refused its own row: %v", err)
+	}
+	if got, _ = s.Get("tok-one"); got.Mode != Background {
+		t.Fatal("the owner's change was not applied")
+	}
+	// And the secret is never in the file, only its hash.
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatal("the secret itself was written to disk")
+	}
+}
+
+// DELETE had no proof at all: anyone who learned a token could turn somebody's
+// notifications off. An *unowned* row is still deleted without one, which is what every
+// build shipped so far expects — and that window closes by itself, because Prune drops a
+// row a week after its device last said hello.
+func TestDeleteNeedsTheSecretOnceThereIsOne(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	const secret = "a-secret-the-device-minted-and-kept"
+	owned := newRegistration("tok-owned")
+	owned.SecretHash = HashSecret(secret)
+	_ = s.Put(owned)
+	_ = s.Put(newRegistration("tok-unowned"))
+
+	if err := s.DeleteIfOwned("tok-owned", ""); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("an owned row was deleted with no secret: %v", err)
+	}
+	if err := s.DeleteIfOwned("tok-owned", "not-the-secret-but-long-enough-yes"); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("an owned row was deleted with the wrong secret: %v", err)
+	}
+	if _, err := s.Get("tok-owned"); err != nil {
+		t.Fatal("the row went anyway")
+	}
+	if err := s.DeleteIfOwned("tok-owned", secret); err != nil {
+		t.Fatalf("the owner could not delete its own row: %v", err)
+	}
+	if err := s.DeleteIfOwned("tok-unowned", ""); err != nil {
+		t.Fatalf("a row from a build that mints no secret must still be removable: %v", err)
+	}
+	// Idempotent, as it has always been: the caller wanted it gone and it is gone.
+	if err := s.DeleteIfOwned("tok-owned", secret); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A device that registered before it knew to mint a secret sends one after it updates,
+// and the first one seen takes the row. It is no weaker than today — anyone who could
+// claim it could already rewrite the row outright — and it is how the protection arrives
+// without a flag day.
+func TestTheFirstSecretSeenTakesAnUnownedRow(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	_ = s.Put(newRegistration("tok-one"))
+	adopting := newRegistration("tok-one")
+	adopting.SecretHash = HashSecret("the-secret-this-build-learned-to-mint")
+	if err := s.Put(adopting); err != nil {
+		t.Fatalf("adopting an unowned row was refused: %v", err)
+	}
+	stranger := newRegistration("tok-one")
+	stranger.SecretHash = HashSecret("some-other-secret-entirely-here-now")
+	if err := s.Put(stranger); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("the row did not stay owned: %v", err)
 	}
 }

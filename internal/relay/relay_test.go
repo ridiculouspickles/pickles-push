@@ -597,3 +597,100 @@ func (p *contextAwarePusher) bounded() bool {
 	defer p.mu.Unlock()
 	return p.deadline
 }
+
+// End to end: the device mints a secret, and from then on the registration is its own.
+//
+// The refusal is a 400 saying "malformed token" — the same answer a token nobody holds
+// would get. An endpoint that answers "that token exists but is not yours" is an
+// endpoint that confirms tokens (pickles-email#463).
+func TestARegistrationBelongsToTheDeviceThatMintedItsSecret(t *testing.T) {
+	r, pusher := newRelay(t)
+	const secret = "a-secret-the-device-minted-and-kept"
+	response := register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","secret":"`+secret+`"}`)
+
+	// The hijack: the victim's delivery token, the attacker's device token.
+	hijack := `{"deviceToken":"9999999999999999999999999999999a",` +
+		`"topic":"net.pickles.mail.dev","token":"` + response.Token + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(hijack))
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("the hijack returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	// A push still reaches the device that owns the row, and not the other one.
+	push := httptest.NewRequest(http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
+	r.Routes().ServeHTTP(httptest.NewRecorder(), push)
+	settle(t, r)
+	sent := pusher.all()
+	if len(sent) != 1 {
+		t.Fatalf("expected one push, got %d", len(sent))
+	}
+	if sent[0].DeviceToken != "abcdef0123456789abcdef0123456789" {
+		t.Fatalf("the push went to %q", sent[0].DeviceToken)
+	}
+
+	// And the owner re-registers as it always did, on every foreground.
+	again := register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","token":"`+response.Token+`","secret":"`+secret+`"}`)
+	if again.Token != response.Token {
+		t.Fatal("the owner did not keep its delivery token")
+	}
+}
+
+// Turning somebody else's notifications off took nothing but their delivery token: the
+// app sends Authorization on DELETE and the relay ignored it.
+func TestUnregisterNeedsTheSecretOnceThereIsOne(t *testing.T) {
+	r, _ := newRelay(t)
+	const secret = "a-secret-the-device-minted-and-kept"
+	response := register(t, r, `{"deviceToken":"abcdef0123456789abcdef0123456789",`+
+		`"topic":"net.pickles.mail.dev","secret":"`+secret+`"}`)
+
+	for _, presented := range []string{"", "not-the-secret-but-long-enough-ok"} {
+		request := httptest.NewRequest(http.MethodDelete, "/v1/register/"+response.Token, nil)
+		if presented != "" {
+			request.Header.Set(managementHeader, presented)
+		}
+		recorder := httptest.NewRecorder()
+		r.Routes().ServeHTTP(recorder, request)
+		// 204 either way: the row is untouched, and saying otherwise would confirm that
+		// the token names something.
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", recorder.Code)
+		}
+		if _, err := r.Store.Get(response.Token); err != nil {
+			t.Fatalf("the registration was deleted by %q", presented)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodDelete, "/v1/register/"+response.Token, nil)
+	request.Header.Set(managementHeader, secret)
+	recorder := httptest.NewRecorder()
+	r.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("the owner got %d", recorder.Code)
+	}
+	if _, err := r.Store.Get(response.Token); err == nil {
+		t.Fatal("the owner could not turn its own notifications off")
+	}
+}
+
+// A secret too short to be unguessable is refused rather than quietly ignored: a device
+// that sent one would otherwise believe its row was protected when it was not.
+func TestATooShortSecretIsRefused(t *testing.T) {
+	r, _ := newRelay(t)
+	for _, secret := range []string{"short", strings.Repeat("a", 31), strings.Repeat("a", 129)} {
+		body := `{"deviceToken":"abcdef0123456789abcdef0123456789",` +
+			`"topic":"net.pickles.mail.dev","secret":"` + secret + `"}`
+		request := httptest.NewRequest(http.MethodPost, "/v1/register", strings.NewReader(body))
+		recorder := httptest.NewRecorder()
+		r.Routes().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("a %d-character secret returned %d", len(secret), recorder.Code)
+		}
+	}
+	// And a registration that sends none is accepted exactly as before, which is what
+	// every build shipped so far does.
+	register(t, r, goodRegistration)
+}
