@@ -110,6 +110,7 @@ func TestGmailPushFromAnotherGoogleAccountIsRefused(t *testing.T) {
 	if code := gmailPush(r, forged, "victim@gmail.com").Code; code != http.StatusForbidden {
 		t.Fatalf("a token minted for another account got %d, want 403", code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("a token minted for another account woke the device")
 	}
@@ -118,6 +119,7 @@ func TestGmailPushFromAnotherGoogleAccountIsRefused(t *testing.T) {
 	if code := gmailPush(r, genuine, "victim@gmail.com").Code; code != http.StatusNoContent {
 		t.Fatalf("the subscription's own token got %d, want 204", code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 1 {
 		t.Fatalf("the subscription's own token sent %d pushes, want 1", len(pusher.all()))
 	}
@@ -179,6 +181,7 @@ func TestGmailEndpointIsClosedWithoutAServiceAccount(t *testing.T) {
 	if code := gmailPush(r, token, "victim@gmail.com").Code; code != http.StatusNotFound {
 		t.Fatalf("with no service account configured the endpoint must not exist, got %d", code)
 	}
+	settle(t, r)
 	if len(pusher.all()) != 0 {
 		t.Fatal("a push was sent with no service account configured")
 	}

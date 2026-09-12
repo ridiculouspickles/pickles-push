@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -315,5 +316,75 @@ func TestOtherDevicesAndOtherAppsAreLeftAlone(t *testing.T) {
 	}
 	if got := s.Count(); got != 3 {
 		t.Fatalf("three distinct registrations, got %d", got)
+	}
+}
+
+// The file is rewritten whole, fsynced and renamed on every write, so its size is the
+// cost of every Put, Delete and Prune — not just storage. A registration with no token
+// mints one, and a StoreKit JWS is replayable, so one valid proof could grow the file at
+// disk speed until each write was rewriting hundreds of megabytes (pickles-email#464).
+func TestASiteWillNotHoldMoreRegistrationsThanItsLimit(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	s.MaxRegistrations = 3
+	for i := range 3 {
+		if err := s.Put(newRegistration(fmt.Sprintf("tok-%d", i))); err != nil {
+			t.Fatalf("registration %d was refused below the limit: %v", i, err)
+		}
+	}
+	if err := s.Put(newRegistration("tok-one-too-many")); !errors.Is(err, ErrFull) {
+		t.Fatalf("expected ErrFull, got %v", err)
+	}
+	if s.Count() != 3 {
+		t.Fatalf("the store grew to %d anyway", s.Count())
+	}
+	// A device already here is never turned away: refreshing an existing row is not
+	// growth, and neither is a device coming back with a new delivery token, because
+	// the row it supersedes is leaving in the same Put.
+	refresh := newRegistration("tok-1")
+	refresh.SeenAt = time.Now()
+	if err := s.Put(refresh); err != nil {
+		t.Fatalf("a device already registered was refused by a full site: %v", err)
+	}
+	returning := newRegistration("tok-1")
+	returning.Token = "tok-1-renewed"
+	if err := s.Put(returning); err != nil {
+		t.Fatalf("a device with a new delivery token was refused by a full site: %v", err)
+	}
+	if s.Count() != 3 {
+		t.Fatalf("superseding a row changed the count to %d", s.Count())
+	}
+}
+
+// A Gmail address is accepted on trust: Pub/Sub names the mailbox and nothing on this
+// path proves the registering device reads it. The cap is what bounds both how much one
+// unverified claim can cost and how far one published message fans out
+// (pickles-email#464).
+func TestOneAddressHoldsOnlySoManyDevices(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	s.MaxPerAddress = 2
+	for i := range 2 {
+		r := newRegistration(fmt.Sprintf("tok-%d", i))
+		r.GmailAddress = "someone@gmail.com"
+		if err := s.Put(r); err != nil {
+			t.Fatalf("device %d was refused below the limit: %v", i, err)
+		}
+	}
+	third := newRegistration("tok-third")
+	third.GmailAddress = "Someone@Gmail.com" // the same address, differently typed
+	if err := s.Put(third); !errors.Is(err, ErrTooManyForAddress) {
+		t.Fatalf("expected ErrTooManyForAddress, got %v", err)
+	}
+	// Another address is another matter, and so is the JMAP path, which has no address
+	// at all.
+	other := newRegistration("tok-other")
+	other.GmailAddress = "different@gmail.com"
+	if err := s.Put(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(newRegistration("tok-jmap")); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.ByGmail("someone@gmail.com")) != 2 {
+		t.Fatalf("the address ended up with %d devices", len(s.ByGmail("someone@gmail.com")))
 	}
 }

@@ -119,6 +119,8 @@ Four endpoints, all JSON.
 POST   /v1/register          {deviceToken, topic, sandbox, mode, gmailAddress?, token?, transaction?}
                              Authorization: Bearer <secret>   (a self-hosted relay)
                              → {token, pushUrl}; 403 with a reason when refused
+                               503 when the site holds as many as it will
+                               409 when one Gmail address has as many devices as it will
 DELETE /v1/register/{token}  → 204, whether or not it existed
 POST   /v1/push/{token}      the JMAP PushSubscription URL; body forwarded unread
 POST   /v1/gmail             Cloud Pub/Sub push, OIDC-verified
@@ -127,7 +129,33 @@ GET    /healthz              → {ok}
 
 `POST /v1/register` has no account behind it: what it checks is a proof — the secret or
 a signed subscription, see above — and the only thing registering buys an attacker is
-the ability to have their own device woken. Rate-limit it at the edge anyway.
+the ability to have their own device woken.
+
+### What is bounded, and where
+
+The edge cannot do this, which is why the binary does. Apache sees a path whose only
+meaningful part is a delivery token it must not log, and one Gmail endpoint shared by
+every subscriber, so *per token* and *per address* are limits only this program can
+express.
+
+| | limit | why |
+|---|---|---|
+| registrations on a site | 5,000 | the file is rewritten whole, fsynced and renamed on every write, so its size is the cost of every write — and a registration with no `token` mints one, from a JWS that can be replayed |
+| devices per Gmail address | 16 | the address is accepted on trust, and this bounds both what one unverified claim costs and how far one published message fans out |
+| registrations per device | 1 per bundle id | not a cap so much as a rule: registering again *replaces*, so a device cannot accumulate rows and be woken twice for one message |
+| pushes to one registration | a burst of 20, then 10 a minute | holding a delivery token means being able to wake a device; it must not mean being able to wake it all night |
+| pushes in flight to Apple | 8, with 1,024 waiting | a flood of pushes is a flood of connections carrying our team's key, and the throttling that follows would not be confined to whoever caused it |
+
+A rate-limited push is **dropped, and the provider is still answered 200**. A 4xx to a
+JMAP server is a retry, and a retry is a second notification to suppress on a device
+that has probably had the first; the device syncs when it is next opened regardless.
+
+**The Gmail address is not verified, and cannot be here.** Any device admitted by the
+policy may register any address and be woken when that mailbox receives mail. There is
+no proof of mailbox ownership on this path — Pub/Sub names the mailbox in the clear and
+that is the only routing key there is — so the per-address cap is a bound on the damage
+rather than a fix. On the JMAP path the question does not arise: the relay is told a URL
+to deliver to and nothing about who is being served.
 
 Sending `token` back on re-registration keeps the same delivery token, which is what lets
 a device keep one provider-side subscription for its lifetime instead of recreating it

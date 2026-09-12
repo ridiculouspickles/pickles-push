@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ridiculouspickles/pickles-push/internal/apns"
@@ -65,6 +66,34 @@ type Relay struct {
 	// Policy is who may register: a subscriber, a holder of this relay's secret, or
 	// anyone. See package entitlement.
 	Policy entitlement.Policy
+
+	start      sync.Once
+	deliveries *deliveryQueue
+	pushes     *limiter
+}
+
+// ready builds what the relay needs the first time it is asked to deliver anything.
+//
+// Lazily, because a Relay is a struct literal at every construction site and a
+// constructor would be a second way to build one that could be got wrong.
+func (r *Relay) ready() {
+	r.start.Do(func() {
+		r.deliveries = newDeliveryQueue(apnsWorkers, queueDepth)
+		r.pushes = newLimiter(pushBurst, pushRefill, r.now)
+	})
+}
+
+// WaitForDeliveries blocks until every queued push has been attempted. Call it after the
+// HTTP server has stopped, so a shutdown does not throw away work already accepted.
+func (r *Relay) WaitForDeliveries() {
+	r.ready()
+	r.deliveries.wait()
+}
+
+// Close stops the delivery workers. After it, nothing more may be submitted.
+func (r *Relay) Close() {
+	r.ready()
+	r.deliveries.close()
 }
 
 func (r *Relay) now() time.Time {
@@ -113,7 +142,14 @@ type registerResponse struct {
 // signed subscription, or this relay's secret — and having checked it the relay keeps
 // nothing but the expiry. The only thing an attacker gains by registering is the
 // ability to have their own device woken up; what must not happen is *unbounded*
-// registration, which is what the rate limiter in front of this is for.
+// registration.
+//
+// **That bound is here, not at the edge.** This comment used to point at "the rate
+// limiter in front of this", and there was none — nor could there usefully be one:
+// Apache sees a path whose only meaningful part is a delivery token it must not log,
+// and one Gmail endpoint shared by every subscriber, so "per token" and "per address"
+// are limits only this program can express. The store caps the file globally and per
+// Gmail address, and `deliver` holds a bucket per registration (pickles-email#464).
 func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 	raw, err := io.ReadAll(io.LimitReader(request.Body, maxRegistration+1))
 	if err != nil {
@@ -191,10 +227,23 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		SeenAt:       now,
 		ExpiresAt:    admission.ExpiresAt,
 	}
-	if err := r.Store.Put(registration); err != nil {
-		// A fixed reason, never Put's error: it can quote what it was given, and what it
-		// was given came from a client. Everything Put validates is validated above, so
-		// what is left here is the file — ours, not the caller's, hence a 500.
+	// A fixed reason in every branch, never Put's error: it can quote what it was
+	// given, and what it was given came from a client.
+	switch err := r.Store.Put(registration); {
+	case err == nil:
+	case errors.Is(err, store.ErrFull):
+		r.Log.Warn("registration refused", "reason", "the site is at its registration limit")
+		// 503 rather than 403: it is a statement about this site, not about this device,
+		// and it may well be true of neither tomorrow.
+		http.Error(w, "this site is not accepting more registrations", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, store.ErrTooManyForAddress):
+		r.Log.Warn("registration refused", "reason", "too many devices for one address")
+		http.Error(w, "too many devices for that address", http.StatusConflict)
+		return
+	default:
+		// Everything Put validates is validated above, so what is left here is the
+		// file — ours, not the caller's, hence a 500.
 		r.Log.Error("registration not stored", "reason", "the store would not write")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -256,7 +305,7 @@ func (r *Relay) handleJMAPPush(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	r.deliver(request.Context(), registration, payload)
+	r.enqueue(registration, payload)
 	// 200 unconditionally once the push is on its way. A JMAP server that reads a 5xx
 	// will retry, and a retry produces a second notification to suppress on a device
 	// that has very likely already had the first.
@@ -356,13 +405,34 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 	payload, err := json.Marshal(map[string]any{"historyId": notification.HistoryID})
 	if err == nil {
 		for _, registration := range registrations {
-			r.deliver(request.Context(), registration, payload)
+			r.enqueue(registration, payload)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------- delivery
+
+// deliveryTimeout bounds one push, including Apple's own twenty-second client timeout.
+const deliveryTimeout = 30 * time.Second
+
+// enqueue hands a push to the workers and returns. See deliveryQueue for why it is not
+// sent from the request goroutine.
+func (r *Relay) enqueue(registration store.Registration, payload []byte) {
+	r.ready()
+	err := r.deliveries.submit(func() {
+		// A context of this program's own. The provider's request is over, and it was
+		// never the thing that should decide how long Apple has.
+		ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+		defer cancel()
+		r.deliver(ctx, registration, payload)
+	})
+	if err != nil {
+		// Full is a site under load; closed is a site shutting down, and one dropped
+		// notification across a restart is the price of not making the provider wait.
+		r.Log.Warn("push dropped", "queue", err.Error())
+	}
+}
 
 // deliver wraps an opaque payload in the smallest APNs envelope that will carry it.
 //
@@ -371,6 +441,19 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 // notification locally before it is shown. If the extension fails or runs out of its
 // thirty seconds, the reader sees "New mail", which is true and says nothing.
 func (r *Relay) deliver(ctx context.Context, registration store.Registration, payload []byte) {
+	r.ready()
+	// Per registration, and checked here because this is the one place both the JMAP
+	// path and the Gmail fan-out pass through. A delivery token is a bearer capability:
+	// holding one means being able to wake a device, and the bucket is what stops it
+	// meaning being able to wake it all night (pickles-email#464).
+	if allowed, firstRefusal := r.pushes.allow(registration.Token); !allowed {
+		if firstRefusal {
+			// Once per spell, not once per push: the refusals arrive at whatever rate
+			// the sender chose, and a line each would hand them the log too.
+			r.Log.Warn("rate limiting pushes to one registration")
+		}
+		return
+	}
 	if !registration.ExpiresAt.IsZero() && !r.now().Before(registration.ExpiresAt) {
 		// The subscription ran out and the device has not re-registered with a renewed
 		// one. Nothing is sent; the row stays until Prune, so a late renewal picks up
