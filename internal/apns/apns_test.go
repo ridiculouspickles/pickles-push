@@ -1,6 +1,7 @@
 package apns
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -150,5 +153,40 @@ func TestBearerIsCachedThenRefreshed(t *testing.T) {
 	}
 	if third == first {
 		t.Fatal("the token was never refreshed, and Apple rejects one over an hour old")
+	}
+}
+
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp 17.188.166.16:443: i/o timeout")
+}
+
+// The relay logs whatever Push returns. net/http wraps a transport failure in a
+// *url.Error carrying the whole request URL, and the device token is a path segment of
+// it — so an ordinary network blip used to write a device token into relay.log, the one
+// thing registrations.json is 0600 to protect (pickles-email#475).
+func TestPushDoesNotPutTheDeviceTokenInItsError(t *testing.T) {
+	const deviceToken = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+	client := &Client{
+		Key:  testKey(t),
+		Now:  time.Now,
+		HTTP: &http.Client{Transport: failingTransport{}},
+	}
+	err := client.Push(context.Background(), Notification{
+		DeviceToken: deviceToken,
+		Topic:       "net.pickles.mail.dev",
+		Payload:     []byte(`{"aps":{}}`),
+	})
+	if err == nil {
+		t.Fatal("a failing transport must still be an error")
+	}
+	if strings.Contains(err.Error(), deviceToken) {
+		t.Fatalf("the device token is in the error, which is logged verbatim: %q", err)
+	}
+	// It has to stay useful: an operator reading relay.log needs to know it was the
+	// network and not, say, an expired key.
+	if !strings.Contains(err.Error(), "i/o timeout") {
+		t.Fatalf("the transport's own reason was lost: %q", err)
 	}
 }

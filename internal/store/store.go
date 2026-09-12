@@ -40,7 +40,12 @@ const (
 	Background Mode = "background"
 )
 
-func (m Mode) valid() bool { return m == Alert || m == Background }
+// Valid reports whether this is a mode the relay knows.
+//
+// Exported so the HTTP layer can refuse an unknown one *before* calling Put, and so log
+// a fixed reason rather than Put's error — which quotes the value it was given, and the
+// value came from a client (pickles-email#475).
+func (m Mode) Valid() bool { return m == Alert || m == Background }
 
 // A Registration is one device, reachable one way.
 //
@@ -141,7 +146,7 @@ func (s *Store) Put(r Registration) error {
 	if r.Token == "" || r.DeviceToken == "" || r.Topic == "" {
 		return errors.New("token, deviceToken and topic are required")
 	}
-	if !r.Mode.valid() {
+	if !r.Mode.Valid() {
 		return fmt.Errorf("unknown mode %q", r.Mode)
 	}
 	s.mu.Lock()

@@ -69,7 +69,7 @@ func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 		if found, ok := j.keys[kid]; ok {
 			return found, nil
 		}
-		return nil, fmt.Errorf("unknown signing key %q", kid)
+		return nil, fmt.Errorf("unknown signing key %q", clip(kid))
 	}
 	response, err := j.client.Get(j.url)
 	if err != nil {
@@ -112,7 +112,7 @@ func (j *jwks) key(kid string) (*rsa.PublicKey, error) {
 	if found, ok := j.keys[kid]; ok {
 		return found, nil
 	}
-	return nil, fmt.Errorf("unknown signing key %q", kid)
+	return nil, fmt.Errorf("unknown signing key %q", clip(kid))
 }
 
 // claimIsTrue reads a boolean claim that some issuers write as the string "true".
@@ -123,6 +123,20 @@ func claimIsTrue(raw json.RawMessage) bool {
 	}
 	var asString string
 	return json.Unmarshal(raw, &asString) == nil && asString == "true"
+}
+
+// clip bounds a value quoted into an error the relay logs.
+//
+// `alg` and `kid` are read out of the JWT header *before* the signature is checked —
+// they have to be, since `kid` is what selects the key — so an unauthenticated caller
+// chooses them, and `relay.go` logs the error. A refusal is worth one line, not a line
+// of whatever length the caller felt like (pickles-email#475).
+func clip(value string) string {
+	const most = 64
+	if len(value) <= most {
+		return value
+	}
+	return value[:most] + "…"
 }
 
 func bigEndianUint(b []byte) uint64 {
@@ -164,7 +178,7 @@ func (r *Relay) verifyPubSub(request *http.Request) error {
 	if head.Alg != "RS256" {
 		// Refusing anything else by name is what stops an "alg: none" token, which is
 		// the oldest hole in JWT verification and still worth closing explicitly.
-		return fmt.Errorf("unexpected algorithm %q", head.Alg)
+		return fmt.Errorf("unexpected algorithm %q", clip(head.Alg))
 	}
 	key, err := sharedJWKS.key(head.Kid)
 	if err != nil {
@@ -209,7 +223,7 @@ func (r *Relay) verifyPubSub(request *http.Request) error {
 		}
 	}
 	if !issuerOK {
-		return fmt.Errorf("unexpected issuer %q", claims.Iss)
+		return fmt.Errorf("unexpected issuer %q", clip(claims.Iss))
 	}
 	if time.Unix(claims.Exp, 0).Before(r.now()) {
 		return errors.New("token expired")
