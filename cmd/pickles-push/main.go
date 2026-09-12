@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -197,7 +198,11 @@ func run(log *slog.Logger) error {
 		_ = server.Shutdown(shutdown)
 	}()
 
-	log.Info("listening", "addr", listen, "registrations", registrations.Count())
+	// The toolchain goes in the line, because "what was this built with" is otherwise
+	// answerable only by having the binary in front of you (pickles-email#526, and #465
+	// makes the same point about the source).
+	log.Info("listening", "addr", listen, "registrations", registrations.Count(),
+		"go", runtime.Version())
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
