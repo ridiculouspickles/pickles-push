@@ -12,6 +12,9 @@
 package store
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +85,28 @@ type Registration struct {
 	// SeenAt is refreshed by re-registration. It is what Prune reads.
 	SeenAt time.Time `json:"seenAt"`
 
+	// SecretHash is the SHA-256, hex, of a secret the *device* minted and keeps beside
+	// its delivery token. Empty means this row is unprotected.
+	//
+	// It exists because the delivery token alone was enough to take a registration
+	// over: Put would overwrite the device token, the topic, the mode and the Gmail
+	// address of whatever row a token named, and Delete removed it with no proof at all
+	// (pickles-email#463). A token travels to the provider and to nobody else, so this
+	// needs a leak first — but the header on this type promises a token holder can
+	// "cause a push to this device and nothing else", and without this the code
+	// promised more than it kept.
+	//
+	// **The device mints it, not the relay.** A relay that issued one would have to be
+	// trusted to keep it, and the rollout would need a flag day: every device already
+	// registered would be handed a secret it did not know to send back, and the next
+	// re-registration would be refused. Minted at the far end, an old client sends
+	// nothing and stays exactly as it is, and a new one is protected from its first
+	// registration.
+	//
+	// The hash, not the secret. There is no operation here that needs the secret back,
+	// and a file of them would be a file of credentials rather than a routing table.
+	SecretHash string `json:"secretHash,omitempty"`
+
 	// ExpiresAt is when the proof this device registered with runs out — a
 	// subscription's expiry plus the grace — after which nothing is delivered to it.
 	// Zero when the proof does not expire (a self-hoster's secret, or an open relay).
@@ -111,12 +136,33 @@ var ErrFull = errors.New("this site is not accepting more registrations")
 // how far one published message fans out, and how much one unverified claim can cost.
 var ErrTooManyForAddress = errors.New("too many registrations for that address")
 
+// ErrWrongSecret means the row is owned and this is not its owner. Callers must not
+// distinguish it from ErrNotFound in anything they send back over the network: an
+// endpoint that tells the difference is an endpoint that confirms tokens for you.
+var ErrWrongSecret = errors.New("registration belongs to another device")
+
 // What a site will hold. Both are generous: the phone, the iPad and the Mac of every
 // subscriber we are likely to have, and then some.
 const (
 	DefaultMaxRegistrations = 5000
 	DefaultMaxPerAddress    = 16
 )
+
+// HashSecret is how a management secret is stored: SHA-256, hex. An empty secret hashes
+// to the empty string rather than to the hash of nothing, because "no secret" has to
+// stay distinguishable from "a secret that happens to be empty".
+func HashSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+// sameHash compares two hex digests without answering sooner for one than the other.
+func sameHash(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
 
 // Store is safe for concurrent use.
 type Store struct {
@@ -189,6 +235,12 @@ func (s *Store) Put(r Registration) error {
 	existing, replacing := s.registrations[r.Token]
 	if replacing {
 		r.CreatedAt = existing.CreatedAt
+		// **An owned row may only be rewritten by its owner.** Checked inside the lock
+		// with the write it guards, so that the check and the write cannot be separated
+		// by another request.
+		if existing.SecretHash != "" && !sameHash(existing.SecretHash, r.SecretHash) {
+			return ErrWrongSecret
+		}
 	}
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = r.SeenAt
@@ -242,6 +294,13 @@ func (s *Store) Put(r Registration) error {
 	// Keyed on the device token and the topic rather than the mode: a site that starts
 	// sending a device alerts instead of silent wakes has changed the same registration,
 	// not added one.
+	//
+	// **Superseding does not ask for the secret**, and must not: a reinstalled device
+	// mints a new secret with its new delivery token, and its old row — same device
+	// token, different secret — is exactly the row that has to go. What the secret
+	// guards is rewriting a row *by its token*; what this does is clear away rows that
+	// name the same device, which only a push to that device could exploit and which is
+	// the duplicate-banner bug it was written for.
 	for token, other := range s.registrations {
 		if token == r.Token {
 			continue
@@ -285,8 +344,30 @@ func (s *Store) ByGmail(address string) []Registration {
 	return found
 }
 
-// Delete removes a registration. Deleting one that is not there is not an error: the
-// caller wanted it gone, and it is gone.
+// DeleteIfOwned removes a registration on behalf of the device that made it.
+//
+// An unowned row — one registered before the device knew to mint a secret — is removed
+// without proof, which is what DELETE has always done. That is the one place the old
+// behaviour survives, and it closes by itself: Prune drops a row a week after its device
+// last said hello, so once a build that mints secrets is the only build in use there are
+// no unowned rows left to take advantage of.
+func (s *Store) DeleteIfOwned(token, secret string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.registrations[token]
+	if !ok {
+		return nil
+	}
+	if existing.SecretHash != "" && !sameHash(existing.SecretHash, HashSecret(secret)) {
+		return ErrWrongSecret
+	}
+	delete(s.registrations, token)
+	return s.flushLocked()
+}
+
+// Delete removes a registration because *we* have decided it is dead — Apple said the
+// device is gone — and asks nobody's permission. Deleting one that is not there is not
+// an error: the caller wanted it gone, and it is gone.
 func (s *Store) Delete(token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
