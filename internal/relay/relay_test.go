@@ -726,3 +726,41 @@ func TestRegisterAcceptsSeveralGmailAccounts(t *testing.T) {
 		}
 	}
 }
+
+// A Gmail wake-up is a cue to sync, never news, so it must not raise a banner even on a
+// registration that asked for alerts (pickles-email#581).
+//
+// Gmail's watch fires for any change to a watched label and offers no filter for
+// deliveries; the device can only find out what happened by fetching, by which time an
+// alert has already put "New mail" on the lock screen and cannot take it back.
+func TestAGmailPushIsSilentEvenInAlertMode(t *testing.T) {
+	r, pusher := newRelay(t)
+	response := register(t, r, goodRegistration)
+	held, err := r.Store.Get(response.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Mode == store.Background {
+		t.Fatal("this test is meaningless unless the registration asked for alerts")
+	}
+
+	r.enqueueSilently(held, []byte(`{"historyId":"1"}`), true)
+	settle(t, r)
+
+	sent := pusher.all()
+	if len(sent) != 1 {
+		t.Fatalf("expected one push, got %d", len(sent))
+	}
+	if !sent[0].Background {
+		t.Fatal("a Gmail wake-up raised a banner; it is right about a minority of pushes")
+	}
+	// And the JMAP path on the same registration still alerts.
+	request := httptest.NewRequest(
+		http.MethodPost, "/v1/push/"+response.Token, strings.NewReader("x"))
+	r.Routes().ServeHTTP(httptest.NewRecorder(), request)
+	settle(t, r)
+	sent = pusher.all()
+	if len(sent) != 2 || sent[1].Background {
+		t.Fatalf("a JMAP push must still alert: %+v", sent)
+	}
+}

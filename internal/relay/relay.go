@@ -456,7 +456,7 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 			r.Log.Error("payload encode failed", "error", err.Error())
 			continue
 		}
-		r.enqueue(registration, payload)
+		r.enqueueSilently(registration, payload, true)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -469,6 +469,32 @@ const deliveryTimeout = 30 * time.Second
 // enqueue hands a push to the workers and returns. See deliveryQueue for why it is not
 // sent from the request goroutine.
 func (r *Relay) enqueue(registration store.Registration, payload []byte) {
+	r.enqueueSilently(registration, payload, false)
+}
+
+// enqueueSilently is enqueue with a say in whether the push may raise a banner.
+//
+// **A Gmail wake-up is never news** (pickles-email#581). Gmail's watch fires for any
+// change to a watched label — a read on another device, an archive, a star, mail
+// arriving that was already seen — and offers no filter for deliveries only; Google's own
+// guidance is to work out what happened afterwards, from history. So the device has to
+// fetch before it can know whether anything arrived, and an *alert* push has already put
+// "New mail" on the lock screen by then. It is right about a minority of pushes and wrong
+// about the rest, and the ones it is wrong about cannot be taken back: an extension has
+// no supported way to decline delivery, and the withdrawal that follows loses its race
+// with the system suspending the process.
+//
+// Silent, then, whatever mode the registration is in: the device wakes, syncs, and names
+// the mail itself if there is any. What it costs is a notification for Gmail mail while
+// the app cannot be started at all — force-quit, or a system that declines the wake — and
+// that is a better failure than a banner that is usually false. JMAP keeps its alert,
+// because `EmailDelivery` fires for deliveries and nothing else.
+func (r *Relay) enqueueSilently(
+	registration store.Registration, payload []byte, silent bool,
+) {
+	if silent {
+		registration.Mode = store.Background
+	}
 	r.ready()
 	err := r.deliveries.submit(func() {
 		// A context of this program's own. The provider's request is over, and it was
