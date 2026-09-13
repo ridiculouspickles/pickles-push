@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -79,7 +80,17 @@ type Registration struct {
 	// GmailAddress is set only for a Gmail registration, because Pub/Sub identifies the
 	// mailbox by address and there is no other way to route the message. Empty on the
 	// JMAP path, which is the whole point of the JMAP path.
+	//
+	// Superseded by GmailAccounts and kept so rows written before it still load; Put
+	// migrates one into the other. A client sending only this still works.
 	GmailAddress string `json:"gmailAddress,omitempty"`
+
+	// GmailAccounts is every Gmail mailbox this device wants waking for.
+	//
+	// One address was enough until somebody had two Gmail accounts, at which point the
+	// second was silently unwatched: the device registered `.first` and nothing said
+	// the other existed (pickles-email#571).
+	GmailAccounts []GmailAccount `json:"gmailAccounts,omitempty"`
 
 	CreatedAt time.Time `json:"createdAt"`
 	// SeenAt is refreshed by re-registration. It is what Prune reads.
@@ -136,6 +147,10 @@ var ErrFull = errors.New("this site is not accepting more registrations")
 // how far one published message fans out, and how much one unverified claim can cost.
 var ErrTooManyForAddress = errors.New("too many registrations for that address")
 
+// ErrTooManyAccounts means one device named more Gmail mailboxes than a registration
+// may carry. See MaxGmailAccounts.
+var ErrTooManyAccounts = errors.New("too many Gmail accounts for one registration")
+
 // ErrWrongSecret means the row is owned and this is not its owner. Callers must not
 // distinguish it from ErrNotFound in anything they send back over the network: an
 // endpoint that tells the difference is an endpoint that confirms tokens for you.
@@ -146,6 +161,10 @@ var ErrWrongSecret = errors.New("registration belongs to another device")
 const (
 	DefaultMaxRegistrations = 5000
 	DefaultMaxPerAddress    = 16
+	// MaxGmailAccounts bounds one device's fan-out. Generous against how many Gmail
+	// accounts anyone signs into one mail client with, and small enough that the list
+	// cannot become a load amplifier (pickles-email#571).
+	MaxGmailAccounts = 8
 )
 
 // HashSecret is how a management secret is stored: SHA-256, hex. An empty secret hashes
@@ -246,6 +265,28 @@ func (s *Store) Put(r Registration) error {
 		r.CreatedAt = r.SeenAt
 	}
 	r.GmailAddress = strings.ToLower(strings.TrimSpace(r.GmailAddress))
+	// **One shape inside, two on the wire.** A client that sends only `gmailAddress`
+	// gets it promoted; one that sends the list gets the first address mirrored back
+	// into the old field, so a rollback reads a sane row rather than an unwatched
+	// device (pickles-email#571).
+	for i := range r.GmailAccounts {
+		r.GmailAccounts[i].Address = strings.ToLower(strings.TrimSpace(r.GmailAccounts[i].Address))
+	}
+	r.GmailAccounts = slices.DeleteFunc(r.GmailAccounts, func(a GmailAccount) bool {
+		return a.Address == ""
+	})
+	if len(r.GmailAccounts) == 0 && r.GmailAddress != "" {
+		r.GmailAccounts = []GmailAccount{{Address: r.GmailAddress}}
+	}
+	if r.GmailAddress == "" && len(r.GmailAccounts) > 0 {
+		r.GmailAddress = r.GmailAccounts[0].Address
+	}
+	// Bounded, because this arrives on trust like the address itself: the fan-out for
+	// one Pub/Sub message is one push per account per device, and an unbounded list is
+	// an unbounded multiplier on a claim nobody verified.
+	if MaxGmailAccounts > 0 && len(r.GmailAccounts) > MaxGmailAccounts {
+		return ErrTooManyAccounts
+	}
 
 	// Counted before anything is written, and counted net: the rows this Put is about
 	// to supersede are leaving, so a device coming back with a new delivery token is
@@ -269,7 +310,7 @@ func (s *Store) Put(r Registration) error {
 			switch {
 			case token == r.Token:
 			case other.DeviceToken == r.DeviceToken && other.Topic == r.Topic:
-			case other.GmailAddress == r.GmailAddress:
+			case other.watches(r.GmailAddress):
 				forAddress++
 			}
 		}
@@ -327,6 +368,49 @@ func (s *Store) Get(token string) (Registration, error) {
 //
 // Plural because one address is read on a phone, an iPad and a Mac, and each of those is
 // its own registration with its own device token.
+// GmailAccount is one mailbox a device wants waking for, and the name it knows it by.
+type GmailAccount struct {
+	Address string `json:"address"`
+
+	// Tag is opaque here and at Apple: a short string the *device* minted, returned to
+	// it in the push so it can tell which of its Gmail accounts a wake-up is about.
+	//
+	// **Why not the address.** The Gmail path is not encrypted — the relay reads the
+	// Pub/Sub envelope to route it — so anything put in the payload crosses APNs in
+	// cleartext and lands in Apple's logs. The address is the one thing about a Gmail
+	// registration that identifies a person, and it is already the least private part
+	// of this design (ADR-0017); sending it onward as well would make that worse for
+	// no reason. A tag says "the second Gmail account on this device" and nothing more.
+	//
+	// Optional: a device that sends none gets no tag back, which is what one-account
+	// devices did before this existed.
+	Tag string `json:"tag,omitempty"`
+}
+
+// TagFor is the tag this registration knows an address by, or "" when it knows none.
+func (r Registration) TagFor(address string) string {
+	address = strings.ToLower(strings.TrimSpace(address))
+	for _, account := range r.GmailAccounts {
+		if account.Address == address {
+			return account.Tag
+		}
+	}
+	return ""
+}
+
+// watches reports whether this registration asked to be woken for an address.
+func (r Registration) watches(address string) bool {
+	if r.GmailAddress == address {
+		return true
+	}
+	for _, account := range r.GmailAccounts {
+		if account.Address == address {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) ByGmail(address string) []Registration {
 	address = strings.ToLower(strings.TrimSpace(address))
 	if address == "" {
@@ -336,7 +420,7 @@ func (s *Store) ByGmail(address string) []Registration {
 	defer s.mu.RUnlock()
 	var found []Registration
 	for _, r := range s.registrations {
-		if r.GmailAddress == address {
+		if r.watches(address) {
 			found = append(found, r)
 		}
 	}

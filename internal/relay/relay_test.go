@@ -694,3 +694,35 @@ func TestATooShortSecretIsRefused(t *testing.T) {
 	// every build shipped so far does.
 	register(t, r, goodRegistration)
 }
+
+// A device with two Gmail accounts registers both, and each carries the tag it will get
+// back in the push (pickles-email#571). Before this, the client sent `.first` and the
+// second mailbox was silently unwatched.
+func TestRegisterAcceptsSeveralGmailAccounts(t *testing.T) {
+	r, _ := newRelay(t)
+	body := `{"deviceToken":"abcdef0123456789abcdef0123456789","topic":"net.pickles.mail.dev",` +
+		`"sandbox":true,"gmailAccounts":[` +
+		`{"address":"Work@Gmail.com","tag":"t1"},{"address":"personal@gmail.com","tag":"t2"}]}`
+	response := register(t, r, body)
+
+	held, err := r.Store.Get(response.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held.GmailAccounts) != 2 {
+		t.Fatalf("stored %d accounts, want 2: %+v", len(held.GmailAccounts), held.GmailAccounts)
+	}
+	// Routing is by address and the address is normalised; the tag is opaque and is not.
+	if got := held.TagFor("work@gmail.com"); got != "t1" {
+		t.Fatalf("tag for the first account was %q", got)
+	}
+	if got := held.TagFor("personal@gmail.com"); got != "t2" {
+		t.Fatalf("tag for the second account was %q", got)
+	}
+	// Both are routable, which is the whole point.
+	for _, address := range []string{"work@gmail.com", "personal@gmail.com"} {
+		if len(r.Store.ByGmail(address)) != 1 {
+			t.Fatalf("%s did not route to the device", address)
+		}
+	}
+}

@@ -488,3 +488,84 @@ func TestTheFirstSecretSeenTakesAnUnownedRow(t *testing.T) {
 		t.Fatalf("the row did not stay owned: %v", err)
 	}
 }
+
+// One device, several Gmail accounts: every one of them has to route, and the tag has to
+// come back so the device can tell which is which (pickles-email#571).
+func TestByGmailFindsEveryAccountOnOneDevice(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	r := newRegistration("tok-phone")
+	r.GmailAccounts = []GmailAccount{
+		{Address: "Work@Gmail.com", Tag: "aaa"},
+		{Address: "personal@gmail.com", Tag: "bbb"},
+	}
+	if err := s.Put(r); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []struct{ address, tag string }{
+		{"work@gmail.com", "aaa"},
+		{"personal@gmail.com", "bbb"},
+	} {
+		found := s.ByGmail(want.address)
+		if len(found) != 1 {
+			t.Fatalf("%s: expected the device, got %d", want.address, len(found))
+		}
+		if got := found[0].TagFor(want.address); got != want.tag {
+			t.Fatalf("%s: tag %q, want %q", want.address, got, want.tag)
+		}
+	}
+	if len(s.ByGmail("someone-else@gmail.com")) != 0 {
+		t.Fatal("an address nobody registered must match nothing")
+	}
+}
+
+// An older client sends one address and no list. It must go on working exactly as it did,
+// and must not be handed a tag it would not understand.
+func TestAnAddressWithNoListIsStillWatched(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	r := newRegistration("tok-old")
+	r.GmailAddress = "Someone@Gmail.com"
+	if err := s.Put(r); err != nil {
+		t.Fatal(err)
+	}
+	found := s.ByGmail("someone@gmail.com")
+	if len(found) != 1 {
+		t.Fatalf("expected the device, got %d", len(found))
+	}
+	if tag := found[0].TagFor("someone@gmail.com"); tag != "" {
+		t.Fatalf("tag %q, want none", tag)
+	}
+	// And the two shapes agree, so a rollback reads a row it understands.
+	if len(found[0].GmailAccounts) != 1 || found[0].GmailAccounts[0].Address != "someone@gmail.com" {
+		t.Fatalf("the address was not promoted into the list: %+v", found[0].GmailAccounts)
+	}
+}
+
+// The list is a fan-out multiplier on a claim nobody verified, so it is bounded.
+func TestTooManyGmailAccountsIsRefused(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	r := newRegistration("tok-greedy")
+	for i := range MaxGmailAccounts + 1 {
+		r.GmailAccounts = append(r.GmailAccounts, GmailAccount{
+			Address: fmt.Sprintf("a%d@gmail.com", i),
+		})
+	}
+	if err := s.Put(r); !errors.Is(err, ErrTooManyAccounts) {
+		t.Fatalf("err = %v, want ErrTooManyAccounts", err)
+	}
+}
+
+// An empty address in the list is dropped rather than stored: it would match the empty
+// lookup ByGmail already refuses, and a row full of blanks is not routing information.
+func TestBlankAccountsAreDropped(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "r.json"))
+	r := newRegistration("tok-blank")
+	r.GmailAccounts = []GmailAccount{{Address: "  "}, {Address: "real@gmail.com"}}
+	if err := s.Put(r); err != nil {
+		t.Fatal(err)
+	}
+	found := s.ByGmail("real@gmail.com")
+	if len(found) != 1 || len(found[0].GmailAccounts) != 1 {
+		t.Fatalf("blank not dropped: %+v", found)
+	}
+}

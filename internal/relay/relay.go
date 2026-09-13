@@ -121,6 +121,10 @@ type registerRequest struct {
 	Sandbox      bool   `json:"sandbox"`
 	Mode         string `json:"mode"`
 	GmailAddress string `json:"gmailAddress,omitempty"`
+	// GmailAccounts is every Gmail mailbox this device wants waking for, each with the
+	// opaque tag it knows that mailbox by. Supersedes GmailAddress, which older clients
+	// still send alone (pickles-email#571).
+	GmailAccounts []store.GmailAccount `json:"gmailAccounts,omitempty"`
 	// Token is sent when re-registering. A device keeps its delivery token for the life
 	// of its subscription, because changing it would mean recreating the subscription
 	// at the provider on every foreground.
@@ -232,15 +236,16 @@ func (r *Relay) handleRegister(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	registration := store.Registration{
-		Token:        token,
-		DeviceToken:  body.DeviceToken,
-		Topic:        body.Topic,
-		Sandbox:      body.Sandbox,
-		Mode:         mode,
-		GmailAddress: body.GmailAddress,
-		SecretHash:   store.HashSecret(body.Secret),
-		SeenAt:       now,
-		ExpiresAt:    admission.ExpiresAt,
+		Token:         token,
+		DeviceToken:   body.DeviceToken,
+		Topic:         body.Topic,
+		Sandbox:       body.Sandbox,
+		Mode:          mode,
+		GmailAddress:  body.GmailAddress,
+		GmailAccounts: body.GmailAccounts,
+		SecretHash:    store.HashSecret(body.Secret),
+		SeenAt:        now,
+		ExpiresAt:     admission.ExpiresAt,
 	}
 	// A fixed reason in every branch, never Put's error: it can quote what it was
 	// given, and what it was given came from a client.
@@ -437,11 +442,21 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 	// neither JSON to parse nor a well-formed RFC 8291 body to decrypt, and the
 	// notification service extension reported "decrypt: malformed" for every Gmail
 	// push. The JMAP path passes raw bytes and always did.
-	payload, err := json.Marshal(map[string]any{"historyId": notification.HistoryID})
-	if err == nil {
-		for _, registration := range registrations {
-			r.enqueue(registration, payload)
+	// **One payload per registration, not one for all of them.** Each device is told
+	// which of *its* Gmail accounts this is about, in its own terms: the tag it minted
+	// and registered. A device with one account, or an older client, gets the payload
+	// exactly as before (pickles-email#571).
+	for _, registration := range registrations {
+		fields := map[string]any{"historyId": notification.HistoryID}
+		if tag := registration.TagFor(notification.EmailAddress); tag != "" {
+			fields["a"] = tag
 		}
+		payload, err := json.Marshal(fields)
+		if err != nil {
+			r.Log.Error("payload encode failed", "error", err.Error())
+			continue
+		}
+		r.enqueue(registration, payload)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
