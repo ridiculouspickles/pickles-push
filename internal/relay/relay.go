@@ -565,6 +565,17 @@ func (r *Relay) deliver(ctx context.Context, registration store.Registration, pa
 	})
 	switch {
 	case err == nil:
+		// **One line per delivery** (pickles-push#14). The success path logged nothing,
+		// so "did that push go out, and when?" was unanswerable from the site: an
+		// accepted push and one never attempted produced the same silence, and a morning
+		// went into a device-side hunt for pushes whose fate here was simply unknown.
+		//
+		// Nothing here reads the payload. `mode` and `topic` are routing, `sandbox` is
+		// which Apple host — no delivery token, which is a bearer capability, and no
+		// address.
+		r.Log.Info("pushed",
+			"mode", registration.Mode, "topic", registration.Topic,
+			"sandbox", registration.Sandbox, "bytes", len(body))
 	case errors.Is(err, apns.ErrUnregistered):
 		// Apple says this device is gone. Believe it — this is the only signal we get,
 		// and keeping the row means pushing into the void until Prune notices.
