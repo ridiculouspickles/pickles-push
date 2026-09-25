@@ -73,6 +73,7 @@ Configuration is environment variables:
 | `PICKLES_PUSH_REGISTRATION_SECRET` | a secret you choose and type into Pickles beside this relay's URL; **set this if you run your own** |
 | `PICKLES_PUSH_SUBSCRIPTION_PRODUCTS` | StoreKit product ids whose signed transaction admits a device; what *our* sites set |
 | `PICKLES_PUSH_SUBSCRIPTION_GRACE` | how long past its expiry a subscription still counts, default `72h` |
+| `PICKLES_PUSH_SILENT_WINDOW` | how long a background push to one registration holds the next, default `30s`; `0` sends every push as it arrives. See *Silent pushes are coalesced* below |
 
 Put a TLS terminator in front of it. The push URL is a bearer capability in a path, and
 over plain http it is a capability anyone on the wire can copy.
@@ -147,11 +148,42 @@ express.
 | devices per Gmail address | 16 | the address is accepted on trust, and this bounds both what one unverified claim costs and how far one published message fans out |
 | registrations per device | 1 per bundle id | not a cap so much as a rule: registering again *replaces*, so a device cannot accumulate rows and be woken twice for one message |
 | pushes to one registration | a burst of 20, then 10 a minute | holding a delivery token means being able to wake a device; it must not mean being able to wake it all night |
+| background pushes to one registration | the first at once, then at most one per 30 s, carrying the newest | iOS rations silent pushes per app per hour; see below |
 | pushes in flight to Apple | 8, with 1,024 waiting | a flood of pushes is a flood of connections carrying our team's key, and the throttling that follows would not be confined to whoever caused it |
 
 A rate-limited push is **dropped, and the provider is still answered 200**. A 4xx to a
 JMAP server is a retry, and a retry is a second notification to suppress on a device
 that has probably had the first; the device syncs when it is next opened regardless.
+
+### Silent pushes are coalesced
+
+iOS throttles `content-available` pushes per app per hour, and does not say where the
+budget stands. The background site hears Fastmail's `Email` StateChange, which fires on
+every read, flag and move, and every Gmail wake-up is sent silently — so ten messages
+read in a web client used to be ten pushes of that budget, spent saying "sync again".
+
+A background push to a registration that had one in the last `PICKLES_PUSH_SILENT_WINDOW`
+(default 30 s) is **held**, and a later one replaces it. The first push of a burst goes at
+once; when the window closes, the held push — the newest — goes out and opens the next
+window; a window that closes on nothing forgets the registration. Sending only the
+newest is right because a payload carries state (JMAP state strings, Gmail's
+`historyId`) and the device syncs to *now*: a wake-up naming a state it has reached is
+one it skips. The provider is answered 200 either way — held is not refused.
+
+- **Alert pushes are never held.** Only a push going out as `background` is coalesced.
+- **Each Gmail mailbox is its own slot**, because the device syncs only the account a
+  push names. On JMAP the relay cannot tell accounts apart — one delivery token serves
+  every JMAP account on the device and the body is ciphertext — so two accounts changing
+  inside one window lose the earlier one's wake-up. It is synced at the next push that
+  names it, the next foreground, or the next scheduled refresh; the alert site is not
+  coalesced and still raises its banner.
+- **A JMAP push within two minutes of a registration is never held.** `PushVerification`
+  codes arrive then, one per account, down the same path, and newest-wins would keep one
+  and lose the rest, leaving those subscriptions unconfirmed.
+- **A held push is sent to the registration as it stands when the window closes**, and
+  dropped if the row has gone — Apple may have reported the device in the meantime.
+- **On shutdown, held pushes are flushed, not dropped**, before the delivery queue
+  closes.
 
 **The Gmail address is not verified, and cannot be here.** Any device admitted by the
 policy may register any address and be woken when that mailbox receives mail. There is

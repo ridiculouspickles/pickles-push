@@ -25,6 +25,9 @@ Environment=PICKLES_PUSH_APNS_TEAM_ID=CHANGEME
 # account a token minted for this audience by anybody's Google Cloud project passes.
 #Environment=PICKLES_PUSH_GMAIL_AUDIENCE=https://push-a.example.com/v1/gmail
 #Environment=PICKLES_PUSH_GMAIL_SERVICE_ACCOUNT=pickles-push@example.iam.gserviceaccount.com
+# How long a background push to one registration holds the next; 30s when unset, 0 turns
+# coalescing off. Alert pushes are never held.
+#Environment=PICKLES_PUSH_SILENT_WINDOW=30s
 
 # **Nothing secret on an Environment= line.** A unit file is 0644 by convention and
 # `systemctl show pickles-push` prints its environment to any user on the box, so a

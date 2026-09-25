@@ -5,7 +5,7 @@
 // possible: the device is the source of truth for its own registration, and the only
 // thing this program stores is a routing table it can rebuild by waiting.
 //
-// Configuration is environment variables, because there are seven of them and a config
+// Configuration is environment variables, because there are a handful of them and a config
 // file format would be the largest thing in the repository.
 //
 //	PICKLES_PUSH_LISTEN         address to listen on            (default :8080)
@@ -36,6 +36,14 @@
 //	PICKLES_PUSH_ALLOW_SANDBOX         "1" admits Sandbox StoreKit transactions from
 //	                                   production registrations. TestFlight needs this;
 //	                                   a shipped relay should not have it.
+//
+// Delivery:
+//
+//	PICKLES_PUSH_SILENT_WINDOW  how long a background push to one registration holds the
+//	                            next (default 30s; "0" sends every one as it arrives).
+//	                            The first goes at once and the newest held one at the
+//	                            window's end; alert pushes are never held. See
+//	                            internal/relay/coalesce.go
 package main
 
 import (
@@ -178,6 +186,21 @@ func run(log *slog.Logger) error {
 		log.Info("registration takes the secret")
 	}
 
+	silentWindow := relay.DefaultSilentWindow
+	if text := os.Getenv("PICKLES_PUSH_SILENT_WINDOW"); text != "" {
+		if silentWindow, err = time.ParseDuration(text); err != nil {
+			return errors.New("PICKLES_PUSH_SILENT_WINDOW is not a duration")
+		}
+		// Bounded above by the hour Apple keeps a background push: a window longer
+		// than that holds a change past the point it would have been delivered at all.
+		if silentWindow < 0 || silentWindow > time.Hour {
+			return errors.New("PICKLES_PUSH_SILENT_WINDOW must be between 0 and 1h")
+		}
+	}
+	if silentWindow == 0 {
+		log.Info("background pushes are not coalesced: PICKLES_PUSH_SILENT_WINDOW is 0")
+	}
+
 	service := &relay.Relay{
 		Store:               registrations,
 		Pusher:              apns.NewClient(key),
@@ -186,6 +209,7 @@ func run(log *slog.Logger) error {
 		GmailAudience:       gmailAudience,
 		GmailServiceAccount: gmailServiceAccount,
 		Policy:              policy,
+		SilentWindow:        silentWindow,
 	}
 
 	server := &http.Server{
@@ -238,13 +262,14 @@ func run(log *slog.Logger) error {
 	// answerable only by having the binary in front of you (pickles-email#526, and #465
 	// makes the same point about the source).
 	log.Info("listening", "addr", listen, "registrations", registrations.Count(),
-		"go", runtime.Version())
+		"silentWindow", silentWindow.String(), "go", runtime.Version())
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	// A push is queued off the request goroutine now, so the listener stopping is not
 	// the end of the work: the provider has already been told 200 for whatever is in
-	// the queue. Refuse new work, then finish what was accepted.
+	// the queue. Refuse new work, then finish what was accepted — which includes the
+	// background pushes held for their window: Close flushes those into the queue first.
 	service.Close()
 	service.WaitForDeliveries()
 	log.Info("stopped")

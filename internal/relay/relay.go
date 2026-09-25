@@ -66,10 +66,19 @@ type Relay struct {
 	// Policy is who may register: a subscriber, a holder of this relay's secret, or
 	// anyone. See package entitlement.
 	Policy entitlement.Policy
+	// SilentWindow is how long a background push to one place holds the next one; see
+	// coalesce.go. Zero sends every push as it arrives, which is what a Relay built
+	// without it has always done; the binary sets DefaultSilentWindow unless told not
+	// to (PICKLES_PUSH_SILENT_WINDOW).
+	SilentWindow time.Duration
 
 	start      sync.Once
 	deliveries *deliveryQueue
 	pushes     *limiter
+	// silent is nil when SilentWindow is zero.
+	silent *coalescer
+	// after is swappable for tests, as Now is; nil means time.AfterFunc.
+	after scheduler
 }
 
 // ready builds what the relay needs the first time it is asked to deliver anything.
@@ -80,6 +89,9 @@ func (r *Relay) ready() {
 	r.start.Do(func() {
 		r.deliveries = newDeliveryQueue(apnsWorkers, queueDepth)
 		r.pushes = newLimiter(pushBurst, pushRefill, r.now)
+		if r.SilentWindow > 0 {
+			r.silent = newCoalescer(r.SilentWindow, r.after, r.sendHeld)
+		}
 	})
 }
 
@@ -90,9 +102,17 @@ func (r *Relay) WaitForDeliveries() {
 	r.deliveries.wait()
 }
 
-// Close stops the delivery workers. After it, nothing more may be submitted.
+// Close sends every background push still held for its window, then stops the delivery
+// workers. After it, nothing more may be submitted.
+//
+// In that order: a held push is the newest state for its slot, and the provider was
+// told 200 for it, so it is flushed into the queue while the queue still takes work
+// rather than dropped (see coalescer.flush).
 func (r *Relay) Close() {
 	r.ready()
+	if r.silent != nil {
+		r.silent.flush()
+	}
 	r.deliveries.close()
 }
 
@@ -456,7 +476,10 @@ func (r *Relay) handleGmailPush(w http.ResponseWriter, request *http.Request) {
 			r.Log.Error("payload encode failed", "error", err.Error())
 			continue
 		}
-		r.enqueueSilently(registration, payload, true)
+		// Its own slot per mailbox: the device syncs only the account a push names, so
+		// one account's newer historyId must not stand in for another's.
+		r.enqueueSilently(registration, payload, true,
+			"gmail\x00"+strings.ToLower(strings.TrimSpace(notification.EmailAddress)))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -469,7 +492,7 @@ const deliveryTimeout = 30 * time.Second
 // enqueue hands a push to the workers and returns. See deliveryQueue for why it is not
 // sent from the request goroutine.
 func (r *Relay) enqueue(registration store.Registration, payload []byte) {
-	r.enqueueSilently(registration, payload, false)
+	r.enqueueSilently(registration, payload, false, "")
 }
 
 // enqueueSilently is enqueue with a say in whether the push may raise a banner.
@@ -489,13 +512,49 @@ func (r *Relay) enqueue(registration store.Registration, payload []byte) {
 // the app cannot be started at all — force-quit, or a system that declines the wake — and
 // that is a better failure than a banner that is usually false. JMAP keeps its alert,
 // because `EmailDelivery` fires for deliveries and nothing else.
+//
+// **A silent push may be held** (coalesce.go): any push that goes out as `background`,
+// whether the device asked for that mode or the Gmail path imposed it, passes through
+// the coalescer, keyed by the registration and `lane` — the Gmail mailbox, or "" on
+// JMAP. An alert push never does.
 func (r *Relay) enqueueSilently(
-	registration store.Registration, payload []byte, silent bool,
+	registration store.Registration, payload []byte, silent bool, lane string,
 ) {
 	if silent {
 		registration.Mode = store.Background
 	}
 	r.ready()
+	if r.silent != nil && registration.Mode == store.Background &&
+		!(lane == "" && r.now().Sub(registration.SeenAt) < freshRegistration) {
+		// The JMAP exemption is freshRegistration's: verification codes arrive just
+		// after a registration, down the same path, and are not state.
+		r.silent.offer(registration.Token+"\x00"+lane, heldPush{registration, payload})
+		return
+	}
+	r.submit(registration, payload)
+}
+
+// sendHeld is the coalescer's way out, for the push that leads a window and the one
+// that trails it.
+//
+// The registration is read again rather than trusted from when the push arrived: a
+// trailing push can be thirty seconds old, and in that time Apple may have reported the
+// device gone, or the device may have re-registered with another APNs token. A row that
+// is no longer held is not pushed to.
+func (r *Relay) sendHeld(_ string, push heldPush) {
+	current, err := r.Store.Get(push.registration.Token)
+	if err != nil {
+		r.Log.Info("dropped a held push for a registration that has gone")
+		return
+	}
+	// Silent whatever the row now says: it was held because it was silent, and a Gmail
+	// wake-up is silent whatever mode the device registered in.
+	current.Mode = store.Background
+	r.submit(current, push.payload)
+}
+
+// submit puts one push on the delivery queue.
+func (r *Relay) submit(registration store.Registration, payload []byte) {
 	err := r.deliveries.submit(func() {
 		// A context of this program's own. The provider's request is over, and it was
 		// never the thing that should decide how long Apple has.
