@@ -744,7 +744,7 @@ func TestAGmailPushIsSilentEvenInAlertMode(t *testing.T) {
 		t.Fatal("this test is meaningless unless the registration asked for alerts")
 	}
 
-	r.enqueueSilently(held, []byte(`{"historyId":"1"}`), true)
+	r.enqueueSilently(held, []byte(`{"historyId":"1"}`), true, "gmail\x00someone@gmail.com")
 	settle(t, r)
 
 	sent := pusher.all()
