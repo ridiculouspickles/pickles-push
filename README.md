@@ -1,13 +1,13 @@
 # pickles-push
 
-A push relay for [Pickles](https://github.com/yeled/pickles-email). It receives a
+A push relay for [Pickles](https://github.com/ridiculouspickles/pickles-email). It receives a
 notification from a mail provider and hands it to Apple. That is the whole program.
 
 It exists because iOS suspends apps, so an iPhone cannot hold a JMAP `EventSource` open
 the way the Mac app does. Everything else about Pickles is local-first and stays that way:
 this is opt-in, off by default, and the app works fully without it. See
-[ADR-0017](https://github.com/yeled/pickles-email/blob/main/docs/adr/0017-push-relay.md)
-for the reasoning and [ADR-0001](https://github.com/yeled/pickles-email/blob/main/docs/adr/0001-no-backend-in-v1.md)
+[ADR-0017](https://github.com/ridiculouspickles/pickles-email/blob/main/docs/adr/0017-push-relay.md)
+for the reasoning and [ADR-0001](https://github.com/ridiculouspickles/pickles-email/blob/main/docs/adr/0001-no-backend-in-v1.md)
 for the position it revises.
 
 ## What it can and cannot see
